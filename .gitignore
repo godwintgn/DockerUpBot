@@ -1,6 +1,6 @@
 .env
 config.yml
-config/
+/config/
 diun.yml
 data/
 *.log
