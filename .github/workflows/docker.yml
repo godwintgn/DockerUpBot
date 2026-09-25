@@ -101,7 +101,7 @@ jobs:
             org.opencontainers.image.title=DockerUpBot
             org.opencontainers.image.description=Telegram bot that applies one Docker Compose update after you approve it. Linux amd64 and arm64.
             org.opencontainers.image.licenses=GPL-3.0
-            org.opencontainers.image.documentation=https://github.com/godwintgn/dockerupbot#image
+            org.opencontainers.image.documentation=https://github.com/godwintgn/DockerUpBot/blob/main/docs/image.md
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-

@@ -13,25 +13,8 @@ DockerUpBot is a self-hosted Telegram bot for Docker Compose image updates. [Diu
 
 </div>
 
-## Image
-
-Public image: `ghcr.io/godwintgn/dockerupbot`
-
-```bash
-docker pull ghcr.io/godwintgn/dockerupbot:latest
-```
-
-| | |
-| --- | --- |
-| Registry | GitHub Container Registry (public) |
-| Tags | `latest` on `main`, plus `X.Y.Z`, `X.Y`, and `X` on a release tag |
-| Systems | Linux **amd64** (PCs and most servers) and Linux **arm64** (64-bit Raspberry Pi, ARM cloud VMs) |
-| Not included | 32-bit ARM, 32-bit x86, RISC-V, and other Linux CPU types |
-| Listens on | `:9467` inside the container. The Compose file does not publish that port. |
-| Needs | Docker socket, your Compose project directory, and a Telegram bot token |
-| License | GPL-3.0 |
-
-The same page you are reading is what GitHub shows on the package. Diun in the Compose file is the separate public image `crazymax/diun:latest`.
+Image pull, tags, and platforms: [docs/image.md](docs/image.md).  
+Operator checks (`dubot`, Diun scan): [docs/debug.md](docs/debug.md).
 
 ## Features
 
