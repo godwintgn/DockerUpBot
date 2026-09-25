@@ -1,8 +1,10 @@
 name: Build and publish Docker image
 
-# Builds on real image-affecting changes to main / PRs.
+# Runs only when files that change the published image change.
+# Docs, logo, Compose, and this workflow file do not trigger a build.
 # Version releases are handled by release.yml (git tags vX.Y.Z).
 on:
+  workflow_dispatch:
   push:
     branches: ["main"]
     paths:
@@ -13,7 +15,6 @@ on:
       - "Dockerfile"
       - ".dockerignore"
       - "VERSION"
-      - ".github/workflows/docker.yml"
   pull_request:
     branches: ["main"]
     paths:
@@ -24,7 +25,6 @@ on:
       - "Dockerfile"
       - ".dockerignore"
       - "VERSION"
-      - ".github/workflows/docker.yml"
 
 permissions:
   contents: read

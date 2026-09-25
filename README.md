@@ -1,3 +1,7 @@
+<div align="center">
+
+<img src="logo.png" alt="DockerUpBot" width="160">
+
 # DockerUpBot
 
 **Diun finds the update. You approve it in Telegram. One service restarts.**
@@ -6,6 +10,8 @@ DockerUpBot is a self-hosted Telegram bot for Docker Compose image updates. [Diu
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Image](https://img.shields.io/badge/ghcr.io-godwintgn%2Fdockerupbot-2496ED)](https://github.com/godwintgn/dockerupbot/pkgs/container/dockerupbot)
+
+</div>
 
 ## Image
 
