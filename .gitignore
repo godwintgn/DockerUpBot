@@ -1,0 +1,13 @@
+.env
+config.yml
+config/
+diun.yml
+data/
+*.log
+.DS_Store
+.idea/
+.vscode/
+graphify-out/
+/tmp/
+video-player/
+DockerUpBot — AI Agent Build Specification.md

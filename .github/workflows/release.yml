@@ -1,0 +1,121 @@
+name: Release
+
+# Publish a semantic version: update VERSION + internal/version, commit, then:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Test, publish image, create release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            go.mod
+
+      - name: Verify tag matches VERSION files
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          FILE="$(tr -d '[:space:]' < VERSION)"
+          PKG="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/version/version.go | head -1)"
+          echo "tag=$TAG file=$FILE pkg=$PKG"
+          test "$TAG" = "$FILE"
+          test "$TAG" = "$PKG"
+
+      - name: Format check
+        run: test -z "$(gofmt -l .)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Resolve version metadata
+        id: ver
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT="${GITHUB_SHA::12}"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dockerupbot
+          labels: |
+            org.opencontainers.image.title=DockerUpBot
+            org.opencontainers.image.description=Telegram bot that applies one Docker Compose update after you approve it. Linux amd64 and arm64.
+            org.opencontainers.image.licenses=GPL-3.0
+            org.opencontainers.image.documentation=https://github.com/godwintgn/dockerupbot#image
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+            COMMIT=${{ steps.ver.outputs.commit }}
+            BUILD_DATE=${{ steps.ver.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          body: |
+            ## Install / upgrade
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository_owner }}/dockerupbot:${{ steps.ver.outputs.version }}
+            docker pull ghcr.io/${{ github.repository_owner }}/dockerupbot:latest
+            ```
+
+            Embedded app version: `${{ steps.ver.outputs.version }}` (`${{ steps.ver.outputs.commit }}`)

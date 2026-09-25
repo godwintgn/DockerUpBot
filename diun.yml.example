@@ -1,0 +1,18 @@
+# Optional — only needed if you prefer a YAML file over Compose env vars.
+# Default stack configures Diun entirely from docker-compose.yml.
+#
+#   cp diun.yml.example diun.yml
+#   then mount: ./diun.yml:/diun.yml:ro
+#
+# Do not put Telegram here — DockerUpBot owns Telegram.
+# Do not put the webhook secret here — use WEBHOOK_SECRET in .env.
+
+watch:
+  workers: 20
+  schedule: "0 */6 * * *"
+  firstCheckNotif: false
+
+providers:
+  docker:
+    watchStopped: false
+    watchByDefault: true

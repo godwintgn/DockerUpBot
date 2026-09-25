@@ -1,0 +1,10 @@
+.git
+.github
+.env
+config.yml
+data
+*.zip
+*.tar.gz
+README.md
+video-player
+DockerUpBot — AI Agent Build Specification.md
