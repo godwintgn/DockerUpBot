@@ -27,6 +27,7 @@ func clearEnv(t *testing.T) {
 		t.Setenv(k, "")
 		_ = os.Unsetenv(k)
 	}
+	t.Setenv("COMPOSE_ROOT", t.TempDir())
 }
 
 func TestLoadNotifyTargetsChatID(t *testing.T) {
@@ -209,5 +210,23 @@ func TestQuietHoursOvernight(t *testing.T) {
 	}
 	if c.InQuietHours(active) {
 		t.Fatal("expected active")
+	}
+}
+
+func TestLoadRejectsUnsafeDeploymentConfiguration(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("TELEGRAM_TOKEN", "tok")
+	t.Setenv("WEBHOOK_SECRET", "sec")
+	t.Setenv("TELEGRAM_CHAT_ID", "-100")
+	file := filepath.Join(t.TempDir(), "config.yml")
+	if _, err := config.Load(file); err == nil || !strings.Contains(err.Error(), "ALLOWED_USERS") {
+		t.Fatalf("expected allow-list error, got %v", err)
+	}
+	t.Setenv("ALLOWED_USERS", "123")
+	for _, root := range []string{"", "/", "relative"} {
+		t.Setenv("COMPOSE_ROOT", root)
+		if _, err := config.Load(file); err == nil || !strings.Contains(err.Error(), "COMPOSE_ROOT") {
+			t.Fatalf("root %q: expected error, got %v", root, err)
+		}
 	}
 }

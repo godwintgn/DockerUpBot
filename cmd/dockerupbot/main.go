@@ -29,10 +29,10 @@ import (
 func main() {
 	applog.Init()
 
-	// Debug CLI: `dubot health|telegram|ping|diun` (also `dockerupbot <cmd>`).
+	// Debug CLI: `dubot health|ready|telegram|ping|diun` (also `dockerupbot <cmd>`).
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "health", "telegram", "ping", "diun", "help", "-h", "--help":
+		case "health", "ready", "telegram", "ping", "diun", "help", "-h", "--help":
 			runCLI(os.Args[1:])
 			return
 		case "serve":
@@ -49,6 +49,9 @@ func main() {
 func runServer() {
 	slog.Info("starting", "app", version.String())
 
+	pollCtx, pollStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer pollStop()
+
 	cfgPath := os.Getenv("CONFIG")
 	if cfgPath == "" {
 		cfgPath = os.Getenv("DOCKERUPBOT_CONFIG")
@@ -62,6 +65,14 @@ func runServer() {
 		slog.Error("config load failed", "err", err)
 		log.Fatal(err)
 	}
+	root, err := filepath.EvalSymlinks(cfg.Update.ComposeRoot)
+	if err != nil || root == string(filepath.Separator) {
+		log.Fatal("COMPOSE_ROOT must resolve to a mounted project directory below the filesystem root")
+	}
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		log.Fatal("COMPOSE_ROOT must be a readable project directory")
+	}
+	cfg.Update.ComposeRoot = root
 	slog.Info("config loaded",
 		"http_addr", cfg.HTTPAddr,
 		"data_path", cfg.DataPath,
@@ -86,11 +97,9 @@ func runServer() {
 		slog.Error("store open failed", "path", dbPath, "err", err)
 		log.Fatal(err)
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			slog.Error("store close failed", "err", err)
-		}
-	}()
+	if err := db.Flush(); err != nil {
+		log.Fatalf("state directory is not writable: %v", err)
+	}
 	slog.Info("store ready", "path", dbPath)
 
 	docker, err := dockerapi.New()
@@ -100,9 +109,9 @@ func runServer() {
 	}
 	defer docker.Close()
 
-	bot := telegram.New(cfg.Telegram.Token, cfg.Telegram.AllowedUsers, cfg.Telegram.RefreshSeconds)
+	bot := telegram.New(cfg.Telegram.Token, cfg.Telegram.AllowedUsers, cfg.Telegram.ChatID)
 
-	ctxInit, cancelInit := context.WithTimeout(context.Background(), 15*time.Second)
+	ctxInit, cancelInit := context.WithTimeout(pollCtx, 15*time.Second)
 	botInfo, err := bot.GetMe(ctxInit)
 	cancelInit()
 	if err != nil {
@@ -116,9 +125,9 @@ func runServer() {
 			"notify_targets", cfg.NotifyTargets(),
 		)
 		// Rebuild allowlist after dropping the bot id.
-		bot = telegram.New(cfg.Telegram.Token, cfg.Telegram.AllowedUsers, cfg.Telegram.RefreshSeconds)
+		bot = telegram.New(cfg.Telegram.Token, cfg.Telegram.AllowedUsers, cfg.Telegram.ChatID)
 	}
-	if len(cfg.NotifyTargets()) == 0 {
+	if len(cfg.Telegram.AllowedUsers) == 0 {
 		slog.Error("no valid notify targets after sanitizing; set ALLOWED_USERS to your Telegram user ID")
 		log.Fatal("no notify targets")
 	}
@@ -136,19 +145,16 @@ func runServer() {
 
 	engine := dock.New(cfg, bot, db, docker, workCtx)
 	engine.RecoverInFlight(workCtx)
-	engine.NotifyRecovery(context.Background())
 
 	handler := diun.NewHandler(engine, cfg.WebhookSecret)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+	liveness := func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	}
+	mux.HandleFunc("/health", liveness)
+	mux.HandleFunc("/healthz", liveness)
+	mux.HandleFunc("/readyz", readiness(pollCtx, bot.PollHealthy, docker.Ping))
 	mux.HandleFunc("/debug/telegram", func(w http.ResponseWriter, r *http.Request) {
 		got := r.Header.Get("Authorization")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(cfg.WebhookSecret)) != 1 {
@@ -205,6 +211,7 @@ func runServer() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -221,15 +228,19 @@ func runServer() {
 		}
 	}()
 
-	pollCtx, pollStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer pollStop()
-	go bot.Run(pollCtx, engine)
-	slog.Info("telegram polling started")
-	if err := bot.SetMyCommands(pollCtx); err != nil {
-		slog.Warn("setMyCommands failed", "err", err)
-	} else {
-		slog.Info("telegram command menu registered")
-	}
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		bot.Run(pollCtx, engine)
+	}()
+	go func() {
+		ctx, cancel := context.WithTimeout(pollCtx, 20*time.Second)
+		defer cancel()
+		engine.NotifyRecovery(ctx)
+		if err := bot.SetMyCommands(ctx); err != nil && ctx.Err() == nil {
+			slog.Warn("setMyCommands failed", "err", err)
+		}
+	}()
 	go engine.RunQuietHoursFlusher(pollCtx)
 
 	if cfg.NotifyEmptyScan {
@@ -247,30 +258,54 @@ func runServer() {
 	<-pollCtx.Done()
 	slog.Info("shutdown signal received")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Warn("http shutdown", "err", err)
-	} else {
-		slog.Info("http server stopped")
+	drained := engine.Drain()
+	grace, cancelGrace := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelGrace()
+	httpShutdown, cancelHTTP := context.WithTimeout(grace, 5*time.Second)
+	if err := srv.Shutdown(httpShutdown); err != nil {
+		slog.Warn("HTTP shutdown", "err", err)
+		_ = srv.Close()
 	}
+	cancelHTTP()
 
 	select {
-	case <-time.After(30 * time.Second):
-		slog.Warn("grace period ended; cancelling in-flight work")
-	case <-func() <-chan struct{} {
-		ch := make(chan struct{})
-		go func() {
-			time.Sleep(2 * time.Second)
-			close(ch)
-		}()
-		return ch
-	}():
-		slog.Info("grace period complete")
+	case <-drained:
+		slog.Info("active work finished")
+	case <-grace.Done():
+		slog.Warn("shutdown grace expired; interrupting active work")
 	}
 	workCancel()
-	_ = db.Close()
+	cleanup, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelCleanup()
+	for _, done := range []<-chan struct{}{drained, pollDone} {
+		select {
+		case <-done:
+		case <-cleanup.Done():
+			slog.Warn("shutdown cleanup timed out; saved queue will be recovered on restart")
+			return
+		}
+	}
 	slog.Info("DockerUpBot stopped")
+}
+
+func readiness(running context.Context, telegramHealthy func() bool, dockerPing func(context.Context) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if running.Err() != nil {
+			http.Error(w, "shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		if !telegramHealthy() {
+			http.Error(w, "Telegram polling is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := dockerPing(ctx); err != nil {
+			http.Error(w, "Docker is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("ok\n"))
+	}
 }
 
 func htmlEscapeDebug(s string) string {

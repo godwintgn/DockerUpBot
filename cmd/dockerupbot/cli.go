@@ -33,7 +33,9 @@ func runCLI(args []string) {
 	case "help", "-h", "--help":
 		printCLIHelp()
 	case "health":
-		cliGET("/health")
+		cliGET("/healthz")
+	case "ready":
+		cliGET("/readyz")
 	case "telegram":
 		cliGET("/debug/telegram")
 	case "ping":
@@ -85,7 +87,8 @@ func printCLIHelp() {
 	fmt.Fprintf(os.Stdout, `dubot — DockerUpBot debug commands (run inside the container)
 
 Usage:
-  dubot health                 Process health JSON
+  dubot health                 Check process liveness
+  dubot ready                  Check Telegram polling and Docker readiness
   dubot telegram               Check Telegram API (getMe, no chat message)
   dubot ping                   Send a test Telegram message to notify targets
   dubot diun --image IMG --container NAME --digest DIGEST

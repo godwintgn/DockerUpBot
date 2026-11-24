@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -15,8 +15,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 
 # Runtime needs the Docker CLI for `docker compose up -d <service>`.
 # Docker socket access typically requires root or docker-group membership;
-# non-root is preferred when a rootless/proxy socket is available (spec §41).
-FROM docker:29-cli
+# non-root is preferred when a rootless/proxy socket is available.
+FROM docker:29-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b82e2509b7d7a7030740d6d
 ARG VERSION=0.1.0
 ARG COMMIT=none
 ARG BUILD_DATE=unknown

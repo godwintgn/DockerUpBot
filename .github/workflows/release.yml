@@ -47,7 +47,9 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./...
+        env:
+          DOCKERUPBOT_TEST_DOCKER: "1"
+        run: go test -race ./...
 
       - name: Resolve version metadata
         id: ver
@@ -90,6 +92,7 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build and push
+        id: image
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -104,7 +107,8 @@ jobs:
             BUILD_DATE=${{ steps.ver.outputs.build_date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: false
+          provenance: mode=min
+          sbom: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -114,8 +118,7 @@ jobs:
             ## Install / upgrade
 
             ```bash
-            docker pull ghcr.io/${{ github.repository_owner }}/dockerupbot:${{ steps.ver.outputs.version }}
-            docker pull ghcr.io/${{ github.repository_owner }}/dockerupbot:latest
+            docker pull ghcr.io/${{ github.repository_owner }}/dockerupbot@${{ steps.image.outputs.digest }}
             ```
 
             Embedded app version: `${{ steps.ver.outputs.version }}` (`${{ steps.ver.outputs.commit }}`)

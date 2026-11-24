@@ -42,10 +42,9 @@ type UpdateConfig struct {
 }
 
 type TelegramConfig struct {
-	Token          string
-	AllowedUsers   []int64
-	ChatID         int64
-	RefreshSeconds int
+	Token        string
+	AllowedUsers []int64
+	ChatID       int64
 }
 
 func EnsureDefault(path string) error {
@@ -120,7 +119,6 @@ func Load(path string) (Config, error) {
 		case "refresh_seconds":
 			if n, e := strconv.Atoi(v); e == nil {
 				c.Update.RefreshSeconds = n
-				c.Telegram.RefreshSeconds = n
 			}
 		case "health_timeout_seconds":
 			if n, e := strconv.Atoi(v); e == nil {
@@ -195,14 +193,17 @@ func Load(path string) (Config, error) {
 		c.RequireHealthy = parseBool(x)
 	}
 
-	if c.Telegram.Token == "" {
+	if c.Telegram.Token == "" || c.Telegram.Token == "123456789:REPLACE_ME" {
 		return c, fmt.Errorf("TELEGRAM_TOKEN is required")
 	}
-	if c.WebhookSecret == "" {
+	if strings.TrimSpace(c.WebhookSecret) == "" || c.WebhookSecret == "CHANGE_ME_TO_A_LONG_RANDOM_SECRET" {
 		return c, fmt.Errorf("WEBHOOK_SECRET is required")
 	}
-	if len(c.Telegram.AllowedUsers) == 0 && c.Telegram.ChatID == 0 {
-		return c, fmt.Errorf("ALLOWED_USERS or TELEGRAM_CHAT_ID is required")
+	if len(c.Telegram.AllowedUsers) == 0 {
+		return c, fmt.Errorf("ALLOWED_USERS must contain at least one Telegram user ID")
+	}
+	if !filepath.IsAbs(c.Update.ComposeRoot) || filepath.Clean(c.Update.ComposeRoot) == string(filepath.Separator) {
+		return c, fmt.Errorf("COMPOSE_ROOT must be an absolute directory below the filesystem root")
 	}
 	if c.QuietHours != "" {
 		if _, _, err := ParseQuietHours(c.QuietHours); err != nil {
@@ -227,7 +228,7 @@ func parseIntList(v string) []int64 {
 	var out []int64
 	for _, s := range strings.Split(v, ",") {
 		n, e := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-		if e == nil {
+		if e == nil && n > 0 {
 			out = append(out, n)
 		}
 	}

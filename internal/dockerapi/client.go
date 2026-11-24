@@ -54,7 +54,26 @@ func New() (*Client, error) {
 	return c, nil
 }
 
-func (c *Client) Close() error { return nil }
+func (c *Client) Close() error {
+	c.http.CloseIdleConnections()
+	return nil
+}
+
+func (c *Client) Ping(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.api("/_ping"), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Docker ping returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
 
 func (c *Client) api(path string) string {
 	return c.baseURL + "/v1.44" + path
@@ -562,38 +581,47 @@ func registryAuthHeader(imageRef string) string {
 	if err != nil {
 		return ""
 	}
+	type authConfig struct {
+		Username      string `json:"username,omitempty"`
+		Password      string `json:"password,omitempty"`
+		IdentityToken string `json:"identitytoken,omitempty"`
+		ServerAddress string `json:"serveraddress"`
+		Auth          string `json:"auth,omitempty"`
+	}
 	var cfg struct {
-		Auths map[string]struct {
-			Auth     string `json:"auth"`
-			Username string `json:"username"`
-			Password string `json:"password"`
-		} `json:"auths"`
+		Auths map[string]authConfig `json:"auths"`
 	}
 	if json.Unmarshal(b, &cfg) != nil {
 		return ""
 	}
 	host := registryHost(imageRef)
-	candidates := []string{host, "https://" + host, "http://" + host, "https://index.docker.io/v1/"}
-	for _, key := range candidates {
-		if ac, ok := cfg.Auths[key]; ok {
-			if ac.Auth != "" {
-				return ac.Auth
-			}
-			if ac.Username != "" {
-				raw := ac.Username + ":" + ac.Password
-				return base64.StdEncoding.EncodeToString([]byte(raw))
-			}
-		}
+	keys := []string{host, "https://" + host, "http://" + host}
+	if host == "docker.io" || host == "index.docker.io" || host == "registry-1.docker.io" {
+		keys = append([]string{"https://index.docker.io/v1/", "docker.io"}, keys...)
 	}
-	for k, ac := range cfg.Auths {
-		if strings.Contains(k, host) || strings.Contains(host, strings.TrimPrefix(strings.TrimPrefix(k, "https://"), "http://")) {
-			if ac.Auth != "" {
-				return ac.Auth
+	for _, key := range keys {
+		auth, ok := cfg.Auths[key]
+		if !ok {
+			continue
+		}
+		if auth.Auth != "" {
+			raw, err := base64.StdEncoding.DecodeString(auth.Auth)
+			if err != nil {
+				raw, err = base64.RawStdEncoding.DecodeString(auth.Auth)
 			}
-			if ac.Username != "" {
-				return base64.StdEncoding.EncodeToString([]byte(ac.Username + ":" + ac.Password))
+			var found bool
+			auth.Username, auth.Password, found = strings.Cut(string(raw), ":")
+			if err != nil || !found {
+				continue
 			}
 		}
+		if auth.Username == "" && auth.IdentityToken == "" {
+			continue
+		}
+		auth.Auth = ""
+		auth.ServerAddress = key
+		value, _ := json.Marshal(auth)
+		return base64.URLEncoding.EncodeToString(value)
 	}
 	return ""
 }

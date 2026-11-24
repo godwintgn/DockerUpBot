@@ -65,3 +65,25 @@ func TestApprovalUsesSnapshotAndRecoveryPreservesNewArrival(t *testing.T) {
 		})
 	}
 }
+
+func TestDrainWaitsForActiveWorkAndRejectsNewStarts(t *testing.T) {
+	e := &Engine{running: true}
+	done := e.Drain()
+	select {
+	case <-done:
+		t.Fatal("drain finished while work was still active")
+	default:
+	}
+	e.mu.Lock()
+	e.finishWorkLocked()
+	e.mu.Unlock()
+
+	select {
+	case <-e.Drain():
+	default:
+		t.Fatal("drain did not finish when work completed")
+	}
+	if _, err := e.acceptConfirmation(1, 1, "old"); err == nil || err.Error() != "bot is shutting down" {
+		t.Fatalf("confirmation during shutdown returned %v", err)
+	}
+}

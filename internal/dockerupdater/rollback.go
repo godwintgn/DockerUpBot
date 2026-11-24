@@ -14,23 +14,19 @@ import (
 	"github.com/dockerupbot/dockerupbot/internal/telegram"
 )
 
-// NotifyRecovery sends a Telegram alert when startup recovery paused jobs.
+// NotifyRecovery publishes saved pending or interrupted work after startup.
 func (e *Engine) NotifyRecovery(ctx context.Context) {
 	e.mu.Lock()
 	n := e.recovered
-	paused := e.paused
+	quiet := e.cfg.InQuietHours(time.Now())
+	if n == 0 && quiet && len(e.pending) > 0 {
+		e.quietBuffered = true
+	}
 	e.mu.Unlock()
 	if n == 0 {
-		pausedFlag, jobs, _ := e.db.GetQueuePaused()
-		if !pausedFlag || len(jobs) == 0 {
-			if !paused {
-				return
-			}
-		} else {
-			n = len(jobs)
+		if !quiet {
+			e.armCoalesce()
 		}
-	}
-	if n == 0 {
 		return
 	}
 	targets := e.cfg.NotifyTargets()
@@ -94,23 +90,25 @@ func (e *Engine) rollbackByID(ctx context.Context, api *telegram.API, chat, msg,
 		return
 	}
 	e.mu.Lock()
-	if e.running {
+	if e.running || e.draining {
 		e.mu.Unlock()
-		_, _ = api.Send(ctx, chat, "An update is already running.", nil)
+		_, _ = api.Send(ctx, chat, "The bot is busy or shutting down.", nil)
 		return
 	}
 	e.running = true
 	e.mu.Unlock()
 	defer func() {
 		e.mu.Lock()
-		e.running = false
+		e.finishWorkLocked()
 		e.mu.Unlock()
 		e.armCoalesce()
 	}()
 
 	_ = api.Edit(ctx, chat, msg, msgHeader("↩️ <b>Rolling back</b>")+
 		fmt.Sprintf("<code>%s</code>\n", htmlEscape(rec.Image)), [][]telegram.Button{})
-	if err := e.restoreImage(ctx, rec); err != nil {
+	work, cancel := context.WithTimeout(e.workCtx, 5*time.Minute)
+	defer cancel()
+	if err := e.restoreImage(work, rec); err != nil {
 		slog.Error("rollback failed", "id", recordID, "err", err)
 		_ = e.db.SetStatus(recordID, store.StatusFailed, "rollback: "+err.Error())
 		_ = api.Edit(ctx, chat, msg, msgHeader("❌ <b>Rollback failed</b>")+htmlEscape(err.Error()), [][]telegram.Button{})

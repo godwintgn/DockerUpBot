@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -80,6 +81,14 @@ func command(ctx context.Context, t Target, args ...string) *exec.Cmd {
 	}
 	cmd := exec.CommandContext(ctx, "docker", append(base, args...)...)
 	cmd.Dir = t.ProjectDir
+	cmd.Env = slices.DeleteFunc(cmd.Environ(), func(entry string) bool {
+		key, _, _ := strings.Cut(entry, "=")
+		switch key {
+		case "TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET", "DOCKERUPBOT_WEBHOOK_SECRET", "DIUN_WEBHOOK_SECRET":
+			return true
+		}
+		return false
+	})
 	return cmd
 }
 

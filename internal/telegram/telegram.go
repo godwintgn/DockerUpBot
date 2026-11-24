@@ -12,35 +12,36 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type API struct {
-	token   string
-	users   map[int64]bool
-	refresh time.Duration
-	mu      sync.Mutex
-	client  *http.Client
+	token    string
+	users    map[int64]bool
+	chatID   int64
+	lastPoll atomic.Int64
+	client   *http.Client
 }
 
-func New(token string, users []int64, refreshSeconds int) *API {
-	m := map[int64]bool{}
-	for _, u := range users {
-		m[u] = true
+func New(token string, users []int64, chatID int64) *API {
+	m := make(map[int64]bool, len(users))
+	for _, user := range users {
+		m[user] = true
 	}
-	if refreshSeconds < 1 {
-		refreshSeconds = 2
-	}
-	return &API{
-		token:   token,
-		users:   m,
-		refresh: time.Duration(refreshSeconds) * time.Second,
-		client:  &http.Client{Timeout: 60 * time.Second},
-	}
+	return &API{token: token, users: m, chatID: chatID, client: &http.Client{Timeout: 60 * time.Second}}
 }
 
 func (a *API) Allowed(id int64) bool { return a.users[id] }
+
+func (a *API) allowedInChat(user, chat int64) bool {
+	return a.Allowed(user) && chat != 0 && (chat == user || chat == a.chatID)
+}
+
+func (a *API) PollHealthy() bool {
+	last := a.lastPoll.Load()
+	return last > 0 && time.Since(time.Unix(last, 0)) < 90*time.Second
+}
 
 // redactErr drops the request URL so a network error cannot include the bot token.
 func (a *API) redactErr(err error) error {
@@ -49,14 +50,13 @@ func (a *API) redactErr(err error) error {
 	}
 	var uerr *url.Error
 	if errors.As(err, &uerr) {
-		return fmt.Errorf("telegram %s: %v", uerr.Op, uerr.Err)
+		err = fmt.Errorf("telegram %s: %v", uerr.Op, uerr.Err)
 	}
 	if a.token != "" && strings.Contains(err.Error(), a.token) {
 		return fmt.Errorf("%s", strings.ReplaceAll(err.Error(), a.token, "[redacted]"))
 	}
 	return err
 }
-func (a *API) allowed(id int64) bool { return a.Allowed(id) }
 
 // BotInfo is the result of Telegram getMe.
 type BotInfo struct {
@@ -99,12 +99,14 @@ type apiError struct {
 func (e *apiError) Error() string { return e.Description }
 
 func (a *API) call(ctx context.Context, method string, values url.Values) (map[string]any, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 	endpoint := "https://api.telegram.org/bot" + a.token + "/" + method
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(values.Encode()))
 		if err != nil {
-			return nil, err
+			return nil, a.redactErr(err)
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		resp, err := a.client.Do(req)
@@ -119,7 +121,7 @@ func (a *API) call(ctx context.Context, method string, values url.Values) (map[s
 			}
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		resp.Body.Close()
 		var out map[string]any
 		if err := json.Unmarshal(body, &out); err != nil {
@@ -252,7 +254,10 @@ type Button struct {
 }
 
 type updateResponse struct {
-	OK     bool `json:"ok"`
+	OK         bool `json:"ok"`
+	Parameters struct {
+		RetryAfter int `json:"retry_after"`
+	} `json:"parameters"`
 	Result []struct {
 		UpdateID int64 `json:"update_id"`
 		Message  *struct {
@@ -289,53 +294,61 @@ func (a *API) Run(ctx context.Context, h Handler) {
 	offset := int64(0)
 	slog.Info("telegram long-polling loop active")
 	for ctx.Err() == nil {
-		v := url.Values{"timeout": {"30"}, "offset": {strconv.FormatInt(offset, 10)}, "allowed_updates": {"[\"message\",\"callback_query\"]"}}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+a.token+"/getUpdates", bytes.NewBufferString(v.Encode()))
-		if err != nil {
-			slog.Warn("telegram getUpdates request build failed", "err", err)
-			time.Sleep(time.Second)
-			continue
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		resp, err := a.client.Do(req)
-		if err != nil {
+		out, status, err := a.poll(ctx, offset)
+		if err != nil || status != http.StatusOK || !out.OK {
 			if ctx.Err() != nil {
 				break
 			}
-			slog.Warn("telegram getUpdates network error", "err", a.redactErr(err))
-			time.Sleep(time.Second)
+			slog.Warn("telegram getUpdates failed", "status", status, "err", a.redactErr(err))
+			delay := max(2, out.Parameters.RetryAfter)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(delay) * time.Second):
+			}
 			continue
 		}
-		var out updateResponse
-		err = json.NewDecoder(resp.Body).Decode(&out)
-		resp.Body.Close()
-		if err != nil {
-			slog.Warn("telegram getUpdates decode error", "err", err)
-			continue
-		}
+		a.lastPoll.Store(time.Now().Unix())
 		for _, u := range out.Result {
 			offset = u.UpdateID + 1
 			if u.Message != nil {
-				if !a.allowed(u.Message.From.ID) {
-					slog.Warn("telegram message ignored: user not allowlisted", "user", u.Message.From.ID)
+				if !a.allowedInChat(u.Message.From.ID, u.Message.Chat.ID) {
+					slog.Warn("telegram message ignored: user or chat not permitted", "user", u.Message.From.ID)
 					continue
 				}
 				h.HandleTelegram(ctx, a, u.Message.Chat.ID, u.Message.MessageID, u.Message.From.ID, u.Message.Text, "", "")
 			}
 			if u.Callback != nil {
-				if !a.allowed(u.Callback.From.ID) {
-					slog.Warn("telegram callback ignored: user not allowlisted", "user", u.Callback.From.ID)
-					a.Answer(ctx, u.Callback.ID, "Unauthorized")
-					continue
-				}
 				chat, msg := int64(0), int64(0)
 				if u.Callback.Message != nil {
 					chat = u.Callback.Message.Chat.ID
 					msg = u.Callback.Message.MessageID
+				}
+				if !a.allowedInChat(u.Callback.From.ID, chat) {
+					slog.Warn("telegram callback ignored: user or chat not permitted", "user", u.Callback.From.ID)
+					a.Answer(ctx, u.Callback.ID, "Unauthorized")
+					continue
 				}
 				h.HandleTelegram(ctx, a, chat, msg, u.Callback.From.ID, "", u.Callback.Data, u.Callback.ID)
 			}
 		}
 	}
 	slog.Info("telegram long-polling stopped")
+}
+
+func (a *API) poll(ctx context.Context, offset int64) (updateResponse, int, error) {
+	v := url.Values{"timeout": {"30"}, "offset": {strconv.FormatInt(offset, 10)}, "allowed_updates": {"[\"message\",\"callback_query\"]"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+a.token+"/getUpdates", bytes.NewBufferString(v.Encode()))
+	if err != nil {
+		return updateResponse{}, 0, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return updateResponse{}, 0, err
+	}
+	defer resp.Body.Close()
+	var out updateResponse
+	err = json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&out)
+	return out, resp.StatusCode, err
 }

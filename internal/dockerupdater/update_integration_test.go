@@ -88,6 +88,9 @@ func TestComposeUpdateAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := client.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
 	db, err := store.Open(filepath.Join(dir, "state.json"))
 	if err != nil {
 		t.Fatal(err)

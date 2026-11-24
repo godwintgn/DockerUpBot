@@ -1,7 +1,5 @@
 name: Build and publish Docker image
 
-# Runs only when files that change the published image change.
-# Docs, logo, Compose, and this workflow file do not trigger a build.
 # Version releases are handled by release.yml (git tags vX.Y.Z).
 on:
   workflow_dispatch:
@@ -14,6 +12,11 @@ on:
       - "go.sum"
       - "Dockerfile"
       - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "docker-compose*.yml"
+      - "deploy.sh"
+      - "scripts/deploy_setup.py"
+      - "tests/deploy*test*"
       - "VERSION"
   pull_request:
     branches: ["main"]
@@ -24,11 +27,15 @@ on:
       - "go.sum"
       - "Dockerfile"
       - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "docker-compose*.yml"
+      - "deploy.sh"
+      - "scripts/deploy_setup.py"
+      - "tests/deploy*test*"
       - "VERSION"
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
@@ -58,12 +65,28 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./...
+        run: go test -race ./...
+
+      - name: Test Compose update and rollback
+        env:
+          DOCKERUPBOT_TEST_DOCKER: "1"
+        run: go test -count=1 -run '^TestComposeUpdateAndRollback$' ./internal/dockerupdater
+
+      - name: Test deployment script
+        run: |
+          sh tests/deploy_test.sh
+          python3 -m unittest discover -s tests -p 'deploy_setup_test.py'
+
+      - name: Validate production Compose config
+        run: DOCKERUPBOT_IMAGE=example.com/dockerupbot@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.production.yml config --no-env-resolution --quiet
 
   docker:
     name: Build Docker image
     runs-on: ubuntu-latest
     needs: test
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5

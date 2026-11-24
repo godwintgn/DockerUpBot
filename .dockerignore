@@ -1,7 +1,10 @@
 .git
 .github
-.env
+.env*
 config.yml
+.aws
+.agents
+.codex
 data
 *.zip
 *.tar.gz

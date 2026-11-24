@@ -1,0 +1,14 @@
+services:
+  dockerupbot:
+    image: ${DOCKERUPBOT_IMAGE:?Set DOCKERUPBOT_IMAGE to the release image digest}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  diun:
+    environment:
+      DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT: "false"

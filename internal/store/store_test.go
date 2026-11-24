@@ -41,7 +41,7 @@ func TestAddSetStatusAndPendingRoundTrip(t *testing.T) {
 	if err := db.SetLatest(42, 99); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Flush(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -49,7 +49,6 @@ func TestAddSetStatusAndPendingRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close()
 	pending := db2.GetPending()
 	if len(pending) != 1 || pending[0].Event.Image != "nginx:latest" {
 		t.Fatalf("pending=%v", pending)
@@ -89,7 +88,6 @@ func TestRollbackMeta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
 	id, _ := db.Add("img:new", "sha256:new", store.StatusPending)
 	if err := db.SetRollbackMeta(id, "proj", "svc", "img:old", "sha256:old", "img:new", "sha256:new", "ctr"); err != nil {
 		t.Fatal(err)
@@ -111,7 +109,10 @@ func TestSaveEventFailureLeavesPendingStateIntact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(path+".tmp", 0700); err != nil {
+	if err := os.Rename(path, path+".previous"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.SaveEvent(diun.Event{Image: first.Image, Digest: "sha256:later"}, items[0].RecordID); err == nil {

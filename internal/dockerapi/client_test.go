@@ -1,15 +1,17 @@
-package dockerapi_test
+package dockerapi
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/dockerupbot/dockerupbot/internal/dockerapi"
 )
 
 // Progress math helpers exercised via PullState aggregation expectations.
 func TestPullStateETA(t *testing.T) {
-	s := dockerapi.PullState{
+	s := PullState{
 		Current:  500,
 		Total:    1000,
 		SpeedBps: 100,
@@ -24,19 +26,36 @@ func TestPullStateETA(t *testing.T) {
 }
 
 func TestPullStatePercentage(t *testing.T) {
-	s := dockerapi.PullState{Current: 76, Total: 100}
+	s := PullState{Current: 76, Total: 100}
 	pct := s.Current * 100 / s.Total
 	if pct != 76 {
 		t.Fatalf("pct=%d", pct)
 	}
 }
 
-func TestRegistryAuthAbsentIsEmpty(t *testing.T) {
-	// New() should succeed with default unix socket config even if socket missing;
-	// construction does not dial.
-	c, err := dockerapi.New()
+func TestRegistryAuthIsScopedAndEngineEncoded(t *testing.T) {
+	config := t.TempDir()
+	t.Setenv("DOCKER_CONFIG", config)
+	path := filepath.Join(config, "config.json")
+	if err := os.WriteFile(path, []byte(`{"auths":{
+		"https://index.docker.io/v1/":{"auth":"aHViOmh1Yi1wYXNz"},
+		"registry.example.com:5000":{"auth":"cHJpdjpzZWNyZXQ="},
+		"registry.example.com.evil":{"username":"other","password":"other"}
+	}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range []string{"unrelated.example.com/app", "registry.example.com/app", "registry.example.com:5001/app"} {
+		if registryAuthHeader(ref) != "" {
+			t.Fatalf("credentials selected for a different registry: %s", ref)
+		}
+	}
+	encoded := registryAuthHeader("registry.example.com:5000/app@sha256:test")
+	raw, err := base64.URLEncoding.DecodeString(encoded)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	var auth map[string]string
+	if err := json.Unmarshal(raw, &auth); err != nil || auth["username"] != "priv" || auth["password"] != "secret" || auth["serveraddress"] != "registry.example.com:5000" {
+		t.Fatal("invalid Docker Engine auth payload", err)
+	}
 }

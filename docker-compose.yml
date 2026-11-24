@@ -3,16 +3,29 @@ services:
     image: ${DOCKERUPBOT_IMAGE:-dockerupbot:local}
     container_name: dockerupbot
     restart: unless-stopped
+    stop_grace_period: 40s
+    labels:
+      diun.enable: "false"
     env_file: .env
+    environment:
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
+      ALLOWED_USERS: ${ALLOWED_USERS:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      COMPOSE_ROOT: ${COMPOSE_ROOT:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${COMPOSE_ROOT}:${COMPOSE_ROOT}:ro
+      - type: bind
+        source: ${COMPOSE_ROOT:?Set COMPOSE_ROOT to the host directory containing your Compose projects}
+        target: ${COMPOSE_ROOT}
+        read_only: true
+        bind:
+          create_host_path: false
       - ./data/bot:/data
     networks:
       - du-tunnel
     mem_limit: 512m
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9467/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9467/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -23,6 +36,13 @@ services:
     container_name: diun
     command: serve
     restart: unless-stopped
+    labels:
+      diun.enable: "false"
+    depends_on:
+      dockerupbot:
+        condition: service_healthy
+      diun-docker:
+        condition: service_healthy
     volumes:
       - ./data/diun:/data
     environment:
@@ -36,7 +56,7 @@ services:
       - DIUN_NOTIF_WEBHOOK_ENDPOINT=http://dockerupbot:9467/webhook/diun
       - DIUN_NOTIF_WEBHOOK_METHOD=POST
       - DIUN_NOTIF_WEBHOOK_HEADERS_CONTENT-TYPE=application/json
-      - DIUN_NOTIF_WEBHOOK_HEADERS_AUTHORIZATION=${WEBHOOK_SECRET}
+      - DIUN_NOTIF_WEBHOOK_HEADERS_AUTHORIZATION=${WEBHOOK_SECRET:?Set WEBHOOK_SECRET to a shared random value}
       - DIUN_NOTIF_WEBHOOK_TIMEOUT=10s
     networks:
       - du-tunnel
@@ -46,6 +66,14 @@ services:
   diun-docker:
     image: ghcr.io/tecnativa/docker-socket-proxy@sha256:be1ac64f33bd82043beb504822a17ba6b71668ea1ad7cf51a9a01d27bb7ab047
     restart: unless-stopped
+    labels:
+      diun.enable: "false"
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2375/_ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     environment:
       CONTAINERS: "1"
       POST: "0"
@@ -55,7 +83,6 @@ services:
       - diun-docker
 
 networks:
-  du-tunnel:
-    name: du-tunnel
+  du-tunnel: {}
   diun-docker:
     internal: true

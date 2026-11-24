@@ -10,6 +10,7 @@ docker compose exec dockerupbot dubot <command>
 
 | Command | What it does |
 |---------|----------------|
+| `dubot ready` | Verify Docker access and a recent successful Telegram poll |
 | `dubot health` | Process health JSON (version + bot username) |
 | `dubot telegram` | Live Telegram `getMe` check (no chat message) |
 | `dubot ping` | Send a test Telegram message to notify targets |

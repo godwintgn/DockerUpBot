@@ -2,7 +2,9 @@ package store
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -114,7 +116,8 @@ func Open(path string) (*JSONStore, error) {
 	return d, nil
 }
 
-func (d *JSONStore) Close() error {
+// Flush writes the current state and checks that its directory supports atomic replacement.
+func (d *JSONStore) Flush() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.persistLocked()
@@ -125,11 +128,35 @@ func (d *JSONStore) persistLocked() error {
 	if e != nil {
 		return e
 	}
-	tmp := d.path + ".tmp"
-	if e = os.WriteFile(tmp, b, 0600); e != nil {
-		return e
+	dir, err := os.Open(filepath.Dir(d.path))
+	if err != nil {
+		return err
 	}
-	return os.Rename(tmp, d.path)
+	defer dir.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(d.path), ".dockerupbot-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), d.path); err != nil {
+		return err
+	}
+	// The rename already committed. Returning an error here would revert memory only.
+	if err := dir.Sync(); err != nil {
+		slog.Error("sync state directory after rename", "err", err)
+	}
+	return nil
 }
 
 func (d *JSONStore) Add(image, digest, status string) (int64, error) {

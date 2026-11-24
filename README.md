@@ -13,8 +13,11 @@ DockerUpBot is a self-hosted Telegram bot for Docker Compose image updates. [Diu
 
 </div>
 
-Image pull, tags, and platforms: [docs/image.md](docs/image.md).  
+Image pull, tags, and platforms: [docs/image.md](docs/image.md).
+
 Operator checks (`dubot`, Diun scan): [docs/debug.md](docs/debug.md).
+
+Production deployment, backups, and upgrades: [docs/production.md](docs/production.md).
 
 ## Features
 
@@ -34,25 +37,24 @@ Operator checks (`dubot`, Diun scan): [docs/debug.md](docs/debug.md).
 
 Commands: `/updates` · `/status` · `/history` · `/help`
 
-## Deploy
+## Run locally
 
-You need Docker with Compose, a Telegram bot from [@BotFather](https://t.me/BotFather), and the host path where your Compose projects live.
+You need Python 3.8+, Docker with Compose, a Telegram bot from [@BotFather](https://t.me/BotFather), and the host path where your Compose projects live.
 
 ```bash
 git clone https://github.com/godwintgn/dockerupbot.git
 cd dockerupbot
-cp .env.example .env
-mkdir -p data/bot data/diun
+./deploy.sh start
 ```
 
-Fill in `.env`:
+The script prompts for missing or invalid settings and saves `.env` after you confirm. Press **Ctrl+C** or enter `:q` at a prompt to cancel. The required settings are:
 
 | Variable | Required | What to put |
 | --- | --- | --- |
 | `TELEGRAM_TOKEN` | yes | BotFather token |
 | `ALLOWED_USERS` | yes | Your numeric Telegram user ID. Comma-separate more than one. |
 | `WEBHOOK_SECRET` | yes | Long random string. Diun sends it as the webhook `Authorization` header. |
-| `COMPOSE_ROOT` | yes | Host directory that contains the stacks you want to update |
+| `COMPOSE_ROOT` | yes | Absolute host directory below `/` that contains the stacks you want to update |
 | `TELEGRAM_CHAT_ID` | no | Chat that receives alerts. If empty, each allowed user is notified. |
 | `TZ` | no | Timezone for Diun’s schedule. Compose falls back to `Asia/Muscat`. |
 | `NOTIFY_EMPTY_SCAN` | no | `true` to ping when a scan finds nothing new |
@@ -62,12 +64,7 @@ Fill in `.env`:
 | `REQUIRE_HEALTHY` | no | `true` to wait for a Docker `HEALTHCHECK` of `healthy` |
 | `PRUNE_AFTER_SUCCESS` | no | `true` to prune dangling images after a clean queue |
 
-Open the bot in Telegram and press **Start** once, so it is allowed to message you. Then:
-
-```bash
-docker build -t dockerupbot:local .
-docker compose up -d
-```
+Open the bot in Telegram and press **Start** once so it can message you. For automation, provision `.env` from `.env.example` and use `./deploy.sh --non-interactive start`. Use `./deploy.sh check` to validate the configuration without starting the stack.
 
 Diun checks every 6 hours and on startup. It webhooks `http://dockerupbot:9467/webhook/diun` only for a real `new` or `update`. The first inventory stays quiet.
 
@@ -77,7 +74,7 @@ Force a scan:
 docker compose restart diun
 ```
 
-The development stack uses the locally built bot image. Set `DOCKERUPBOT_IMAGE` in `.env` to use a published release tag or a pinned commit image. Main-branch builds publish `edge` and a commit tag.
+The script builds and uses `dockerupbot:local` by default. A tag in `DOCKERUPBOT_IMAGE` uses the development configuration, and an image digest also applies `docker-compose.production.yml`. Use `--mode dev` or `--mode production` to choose explicitly. Run `./deploy.sh --help` for the management commands.
 
 ### `data/bot/config.yml`
 

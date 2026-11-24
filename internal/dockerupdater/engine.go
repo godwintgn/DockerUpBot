@@ -30,6 +30,8 @@ type Engine struct {
 	mu            sync.Mutex
 	pending       []store.PendingItem
 	running       bool
+	draining      bool
+	drained       chan struct{}
 	paused        bool
 	selectMode    bool
 	latest        map[int64]int64
@@ -83,11 +85,19 @@ func (e *Engine) RecoverInFlight(ctx context.Context) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	paused, jobs, index := e.db.GetQueuePaused()
+	history := e.db.ListHistory(0)
+	for _, record := range history {
+		if record.Status == store.StatusRollingBack {
+			if err := e.db.SetStatus(record.ID, store.StatusFailed, "rollback interrupted; inspect the service before retrying from /history"); err != nil {
+				slog.Error("save interrupted rollback", "id", record.ID, "err", err)
+			}
+		}
+	}
 	var recoveredIDs []int64
 	if !paused || index < 0 || index >= len(jobs) {
 		// Older state files recorded the running batch only in history.
 		jobs, index = nil, 0
-		for _, r := range e.db.ListHistory(0) {
+		for _, r := range history {
 			switch r.Status {
 			case store.StatusPulling, store.StatusPulled, store.StatusUpdating, store.StatusVerifying, store.StatusQueued, store.StatusApproved:
 				jobs = append(jobs, store.PendingItem{
@@ -167,16 +177,41 @@ func (e *Engine) setLatestLocked(chat, msg int64) {
 	}
 }
 
+// Drain prevents new update work and closes the returned channel once active work ends.
+func (e *Engine) Drain() <-chan struct{} {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.draining {
+		e.draining = true
+		e.drained = make(chan struct{})
+		if !e.running {
+			close(e.drained)
+		}
+	}
+	return e.drained
+}
+
+func (e *Engine) finishWorkLocked() {
+	e.running = false
+	if e.draining {
+		close(e.drained)
+	}
+}
+
 func (e *Engine) armCoalesce() {
 	e.mu.Lock()
-	if e.coalesceArmed || e.running || e.paused {
+	if e.draining || e.coalesceArmed || e.running || e.paused || len(e.pending) == 0 {
 		e.mu.Unlock()
 		return
 	}
 	e.coalesceArmed = true
 	e.mu.Unlock()
 	go func() {
-		time.Sleep(coalesceDelay)
+		select {
+		case <-e.workCtx.Done():
+			return
+		case <-time.After(coalesceDelay):
+		}
 		if e.cfg.InQuietHours(time.Now()) {
 			e.mu.Lock()
 			e.coalesceArmed = false
@@ -197,7 +232,7 @@ func (e *Engine) armCoalesce() {
 
 func (e *Engine) notifyPending() {
 	e.mu.Lock()
-	if e.running || e.paused || len(e.pending) == 0 {
+	if e.draining || e.running || e.paused || len(e.pending) == 0 {
 		e.mu.Unlock()
 		return
 	}
@@ -221,7 +256,7 @@ func (e *Engine) notifyPending() {
 			continue
 		}
 		e.mu.Lock()
-		if e.running || e.paused || e.latest[chat] != previous || e.confirmations[chat].token != "" {
+		if e.draining || e.running || e.paused || e.latest[chat] != previous || e.confirmations[chat].token != "" {
 			e.mu.Unlock()
 			_ = e.bot.StripButtons(ctx, chat, id)
 			continue
@@ -272,7 +307,7 @@ func (e *Engine) HandleTelegram(ctx context.Context, api *telegram.API, chatID i
 
 func (e *Engine) Handle(ctx context.Context, api *telegram.API, chatID int64, msgID int64, fromID int64, text, callback, callbackID string) {
 	if text != "" {
-		slog.Info("telegram command", "user", fromID, "chat", chatID, "text", text)
+		slog.Info("telegram command", "user", fromID, "chat", chatID)
 	}
 	if callback != "" {
 		slog.Info("telegram callback", "user", fromID, "chat", chatID, "message", msgID, "callback", callback)
@@ -687,13 +722,16 @@ func (e *Engine) startQueue(ctx context.Context, api *telegram.API, chatID, msgI
 		api.Answer(ctx, callbackID, err.Error())
 		return
 	}
-	api.Answer(ctx, callbackID, "Update queue started")
 	go e.runQueue(e.workCtx, api, chatID, msgID, jobs)
+	api.Answer(ctx, callbackID, "Update queue started")
 }
 
 func (e *Engine) acceptConfirmation(chat, msg int64, token string) ([]store.PendingItem, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.draining {
+		return nil, errors.New("bot is shutting down")
+	}
 	if e.running {
 		return nil, errors.New("an update is already running")
 	}
@@ -743,6 +781,11 @@ func withoutJobs(pending []store.PendingItem, ids []int64) []store.PendingItem {
 
 func (e *Engine) pausedQueueAction(ctx context.Context, api *telegram.API, chat, msg int64, callbackID, action string) {
 	e.mu.Lock()
+	if e.draining {
+		e.mu.Unlock()
+		api.Answer(ctx, callbackID, "Bot is shutting down")
+		return
+	}
 	if e.running {
 		e.mu.Unlock()
 		api.Answer(ctx, callbackID, "An update is already running")
@@ -775,11 +818,12 @@ func (e *Engine) pausedQueueAction(ctx context.Context, api *telegram.API, chat,
 		buttons = [][]telegram.Button{}
 	}
 	e.mu.Unlock()
-	api.Answer(ctx, callbackID, "")
 	if len(jobs) > 0 {
 		go e.runQueue(e.workCtx, api, chat, msg, jobs)
+		api.Answer(ctx, callbackID, "")
 		return
 	}
+	api.Answer(ctx, callbackID, "")
 	_ = api.Edit(ctx, chat, msg, text, buttons)
 }
 
@@ -889,7 +933,7 @@ func (e *Engine) runQueue(ctx context.Context, api *telegram.API, chat, msg int6
 		}
 		e.pauseAfter = false
 		e.cancelRun = false
-		e.running = false
+		e.finishWorkLocked()
 		e.activeChat, e.activeMsg = 0, 0
 		e.mu.Unlock()
 		slog.Info("update queue idle")
@@ -1038,6 +1082,8 @@ func (e *Engine) showHeld(ctx context.Context, api *telegram.API, chat, msg int6
 }
 
 func (e *Engine) runOne(ctx, opCtx context.Context, api *telegram.API, chat, msg int64, n, total int, item store.PendingItem) (queueResult, error) {
+	opCtx, cancel := context.WithTimeout(opCtx, 45*time.Minute)
+	defer cancel()
 	ev := item.Event
 	image := ev.Image
 	start := time.Now()
