@@ -56,33 +56,30 @@ type LatestMessage struct {
 }
 
 type State struct {
-	Records     []Record       `json:"records"`
-	Pending     []PendingItem  `json:"pending"`
-	Latest      *LatestMessage `json:"latest,omitempty"`
-	QueuePaused bool           `json:"queue_paused,omitempty"`
-	PausedJobs  []PendingItem  `json:"paused_jobs,omitempty"`
-	PausedIndex int            `json:"paused_index,omitempty"`
-	SelectMode  bool           `json:"select_mode,omitempty"`
+	Records      []Record        `json:"records"`
+	Pending      []PendingItem   `json:"pending"`
+	Latest       *LatestMessage  `json:"latest,omitempty"`
+	LatestByChat map[int64]int64 `json:"latest_by_chat,omitempty"`
+	QueuePaused  bool            `json:"queue_paused,omitempty"`
+	PausedJobs   []PendingItem   `json:"paused_jobs,omitempty"`
+	PausedIndex  int             `json:"paused_index,omitempty"`
+	SelectMode   bool            `json:"select_mode,omitempty"`
 }
 
 // Store is the persistence interface (spec §53).
 type Store interface {
-	Close() error
-	Add(image, digest, status string) (int64, error)
+	SaveEvent(event diun.Event, replaceID int64) ([]PendingItem, error)
+	SaveQueue(pending, paused []PendingItem, index int, selectMode bool, ids []int64, status string) error
 	SetStatus(id int64, status, errText string) error
 	SetRollbackMeta(id int64, project, service, prevImage, prevDigest, newImage, newDigest, containerName string) error
 	AppendLog(id int64, logText string) error
 	Get(id int64) (Record, bool)
 	ListHistory(limit int) []Record
 	GetPending() []PendingItem
-	SetPending(items []PendingItem) error
-	GetLatest() *LatestMessage
+	LatestMessages() map[int64]int64
 	SetLatest(chatID, messageID int64) error
-	ClearLatest() error
 	GetQueuePaused() (bool, []PendingItem, int)
-	SetQueuePaused(paused bool, jobs []PendingItem, index int) error
 	GetSelectMode() bool
-	SetSelectMode(on bool) error
 }
 
 type JSONStore struct {
@@ -104,7 +101,16 @@ func Open(path string) (*JSONStore, error) {
 				d.data.Records = records
 			}
 		}
+	} else if !os.IsNotExist(e) {
+		return nil, e
 	}
+	if d.data.LatestByChat == nil {
+		d.data.LatestByChat = make(map[int64]int64)
+		if latest := d.data.Latest; latest != nil {
+			d.data.LatestByChat[latest.ChatID] = latest.MessageID
+		}
+	}
+	d.data.Latest = nil
 	return d, nil
 }
 
@@ -129,6 +135,15 @@ func (d *JSONStore) persistLocked() error {
 func (d *JSONStore) Add(image, digest, status string) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	id := d.addLocked(image, digest, status)
+	if err := d.persistLocked(); err != nil {
+		d.data.Records = d.data.Records[:len(d.data.Records)-1]
+		return 0, err
+	}
+	return id, nil
+}
+
+func (d *JSONStore) addLocked(image, digest, status string) int64 {
 	var id int64
 	for _, r := range d.data.Records {
 		if r.ID > id {
@@ -145,12 +160,72 @@ func (d *JSONStore) Add(image, digest, status string) (int64, error) {
 		NewImage:   image,
 		NewDigest:  digest,
 	})
-	return id, d.persistLocked()
+	return id
+}
+
+func (d *JSONStore) SaveEvent(event diun.Event, replaceID int64) ([]PendingItem, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	before := d.data
+	d.data.Records = append([]Record(nil), before.Records...)
+	d.data.Pending = append([]PendingItem(nil), before.Pending...)
+	id := d.addLocked(event.Image, event.Digest, StatusPending)
+	item := PendingItem{RecordID: id, Event: event, Selected: !d.data.SelectMode}
+	for i, pending := range d.data.Pending {
+		if pending.RecordID == replaceID {
+			item.Selected = pending.Selected
+			d.data.Pending[i] = item
+			break
+		}
+	}
+	if replaceID == 0 {
+		d.data.Pending = append(d.data.Pending, item)
+	}
+	// A paused job still refers to the digest originally approved.
+	for _, job := range d.data.PausedJobs {
+		if job.RecordID == replaceID {
+			replaceID = 0
+			break
+		}
+	}
+	if replaceID != 0 {
+		d.setStatusLocked(replaceID, StatusSkipped, "superseded by a new digest")
+	}
+	if err := d.persistLocked(); err != nil {
+		d.data = before
+		return nil, err
+	}
+	return append([]PendingItem(nil), d.data.Pending...), nil
+}
+
+func (d *JSONStore) SaveQueue(pending, paused []PendingItem, index int, selectMode bool, ids []int64, status string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	before := d.data
+	d.data.Records = append([]Record(nil), before.Records...)
+	d.data.Pending = append([]PendingItem(nil), pending...)
+	d.data.PausedJobs = append([]PendingItem(nil), paused...)
+	d.data.QueuePaused = len(paused) > 0
+	d.data.PausedIndex = index
+	d.data.SelectMode = selectMode
+	for _, id := range ids {
+		d.setStatusLocked(id, status, "")
+	}
+	if err := d.persistLocked(); err != nil {
+		d.data = before
+		return err
+	}
+	return nil
 }
 
 func (d *JSONStore) SetStatus(id int64, status, errText string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.setStatusLocked(id, status, errText)
+	return d.persistLocked()
+}
+
+func (d *JSONStore) setStatusLocked(id int64, status, errText string) {
 	for i := range d.data.Records {
 		if d.data.Records[i].ID == id {
 			d.data.Records[i].Status = status
@@ -158,11 +233,12 @@ func (d *JSONStore) SetStatus(id int64, status, errText string) error {
 			if status == StatusSuccess || status == StatusFailed || status == StatusSkipped || status == StatusRolledBack {
 				t := time.Now().UTC()
 				d.data.Records[i].CompletedAt = &t
+			} else {
+				d.data.Records[i].CompletedAt = nil
 			}
 			break
 		}
 	}
-	return d.persistLocked()
 }
 
 func (d *JSONStore) SetRollbackMeta(id int64, project, service, prevImage, prevDigest, newImage, newDigest, containerName string) error {
@@ -239,27 +315,20 @@ func (d *JSONStore) SetPending(items []PendingItem) error {
 	return d.persistLocked()
 }
 
-func (d *JSONStore) GetLatest() *LatestMessage {
+func (d *JSONStore) LatestMessages() map[int64]int64 {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.data.Latest == nil {
-		return nil
+	out := make(map[int64]int64, len(d.data.LatestByChat))
+	for chat, msg := range d.data.LatestByChat {
+		out[chat] = msg
 	}
-	cp := *d.data.Latest
-	return &cp
+	return out
 }
 
 func (d *JSONStore) SetLatest(chatID, messageID int64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.data.Latest = &LatestMessage{ChatID: chatID, MessageID: messageID}
-	return d.persistLocked()
-}
-
-func (d *JSONStore) ClearLatest() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.data.Latest = nil
+	d.data.LatestByChat[chatID] = messageID
 	return d.persistLocked()
 }
 
@@ -271,24 +340,8 @@ func (d *JSONStore) GetQueuePaused() (bool, []PendingItem, int) {
 	return d.data.QueuePaused, jobs, d.data.PausedIndex
 }
 
-func (d *JSONStore) SetQueuePaused(paused bool, jobs []PendingItem, index int) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.data.QueuePaused = paused
-	d.data.PausedJobs = append([]PendingItem(nil), jobs...)
-	d.data.PausedIndex = index
-	return d.persistLocked()
-}
-
 func (d *JSONStore) GetSelectMode() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.data.SelectMode
-}
-
-func (d *JSONStore) SetSelectMode(on bool) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.data.SelectMode = on
-	return d.persistLocked()
 }

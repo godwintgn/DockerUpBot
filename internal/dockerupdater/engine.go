@@ -2,6 +2,8 @@ package dockerupdater
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,8 +32,10 @@ type Engine struct {
 	running       bool
 	paused        bool
 	selectMode    bool
-	latestChat    int64
-	latestMsg     int64
+	latest        map[int64]int64
+	confirmations map[int64]confirmation
+	activeChat    int64
+	activeMsg     int64
 	workCtx       context.Context
 	lastFailID    int64
 	recovered     int
@@ -41,6 +45,11 @@ type Engine struct {
 	pauseAfter    bool
 	cancelRun     bool
 	runCancel     context.CancelFunc
+}
+
+type confirmation struct {
+	token string
+	jobs  []store.PendingItem
 }
 
 const coalesceDelay = 8 * time.Second
@@ -54,10 +63,8 @@ var errUserCancel = errors.New("update cancelled")
 func New(c config.Config, b *telegram.API, d store.Store, docker *dockerapi.Client, workCtx context.Context) *Engine {
 	e := &Engine{cfg: c, bot: b, db: d, docker: docker, workCtx: workCtx}
 	e.pending = d.GetPending()
-	if latest := d.GetLatest(); latest != nil {
-		e.latestChat = latest.ChatID
-		e.latestMsg = latest.MessageID
-	}
+	e.latest = d.LatestMessages()
+	e.confirmations = make(map[int64]confirmation)
 	e.selectMode = d.GetSelectMode()
 	paused, jobs, _ := d.GetQueuePaused()
 	e.paused = paused
@@ -73,100 +80,96 @@ func New(c config.Config, b *telegram.API, d store.Store, docker *dockerapi.Clie
 
 // RecoverInFlight reconciles jobs left in pulling/updating after a crash (spec §56).
 func (e *Engine) RecoverInFlight(ctx context.Context) {
-	hist := e.db.ListHistory(50)
-	recovered := 0
-	for _, r := range hist {
-		switch r.Status {
-		case store.StatusPulling, store.StatusUpdating, store.StatusVerifying, store.StatusQueued, store.StatusApproved:
-			slog.Warn("recovering interrupted job", "id", r.ID, "image", r.Image, "status", r.Status)
-			_ = e.db.SetStatus(r.ID, store.StatusPaused, "interrupted by restart; manual continue required")
-			item := store.PendingItem{
-				RecordID: r.ID,
-				Event: diun.Event{
-					Image:  r.Image,
-					Digest: r.Digest,
-					Status: "update",
-					Metadata: map[string]string{
-						"ctn_names": r.ContainerName,
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	paused, jobs, index := e.db.GetQueuePaused()
+	var recoveredIDs []int64
+	if !paused || index < 0 || index >= len(jobs) {
+		// Older state files recorded the running batch only in history.
+		jobs, index = nil, 0
+		for _, r := range e.db.ListHistory(0) {
+			switch r.Status {
+			case store.StatusPulling, store.StatusPulled, store.StatusUpdating, store.StatusVerifying, store.StatusQueued, store.StatusApproved:
+				jobs = append(jobs, store.PendingItem{
+					RecordID: r.ID,
+					Selected: true,
+					Event: diun.Event{
+						Image: r.Image, Digest: r.Digest, Status: "update",
+						Metadata: map[string]string{"ctn_names": r.ContainerName},
 					},
-				},
+				})
+				recoveredIDs = append(recoveredIDs, r.ID)
 			}
-			e.mu.Lock()
-			found := false
-			for _, p := range e.pending {
-				if p.RecordID == r.ID || (p.Event.Image == r.Image && p.Event.Digest == r.Digest) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				e.pending = append(e.pending, item)
-				_ = e.db.SetPending(e.pending)
-			}
-			e.paused = true
-			_ = e.db.SetQueuePaused(true, e.pending, 0)
-			e.mu.Unlock()
-			recovered++
 		}
 	}
-	if recovered > 0 {
-		e.mu.Lock()
-		e.recovered = recovered
-		e.mu.Unlock()
-		slog.Warn("startup recovery complete", "interrupted_jobs", recovered, "queue", "paused")
-	} else {
-		slog.Info("startup recovery: no interrupted jobs")
+	if len(jobs) == 0 {
+		return
 	}
+	pending := mergePending(e.pending, jobs[index:])
+	if err := e.db.SaveQueue(pending, jobs, index, e.selectMode, recoveredIDs, store.StatusPaused); err != nil {
+		slog.Error("save recovered queue", "err", err)
+	}
+	e.pending, e.paused = pending, true
+	e.recovered = len(jobs) - index
+	e.lastFailID = jobs[index].RecordID
+	slog.Warn("startup recovery paused interrupted work", "jobs", e.recovered)
 }
 
-func (e *Engine) DiunEvent(ev diun.Event) {
-	ctn := ""
-	if ev.Metadata != nil {
-		ctn = strings.TrimPrefix(strings.Split(ev.Metadata["ctn_names"], ",")[0], "/")
+func (e *Engine) DiunEvent(ev diun.Event) error {
+	if ev.DigestRef() == "" {
+		return fmt.Errorf("missing immutable image reference")
 	}
-	if e.cfg.ShouldSkip(ev.Image, ctn) {
-		slog.Info("update skipped by policy", "image", ev.Image, "container", ctn)
-		return
+	name := containerName(ev)
+	if e.cfg.ShouldSkip(ev.Image, name) {
+		return nil
 	}
 	e.mu.Lock()
-	for i, p := range e.pending {
-		if p.Event.Image == ev.Image {
-			e.pending[i].Event = ev
-			_ = e.db.SetPending(e.pending)
-			e.mu.Unlock()
-			slog.Info("pending image refreshed", "image", ev.Image, "digest", shortDigest(ev.Digest))
-			e.armCoalesce()
-			return
+	var replaceID int64
+	for _, p := range e.pending {
+		if dockerapi.SameImageRef(p.Event.Image, ev.Image) && containerName(p.Event) == name {
+			if p.Event.Digest == ev.Digest {
+				e.mu.Unlock()
+				return nil
+			}
+			replaceID = p.RecordID
+			break
 		}
 	}
-	id, err := e.db.Add(ev.Image, ev.Digest, store.StatusPending)
+	pending, err := e.db.SaveEvent(ev, replaceID)
 	if err != nil {
 		e.mu.Unlock()
-		slog.Error("failed to persist pending update", "image", ev.Image, "err", err)
-		return
+		return err
 	}
-	item := store.PendingItem{RecordID: id, Event: ev, Selected: true}
-	e.pending = append(e.pending, item)
-	_ = e.db.SetPending(e.pending)
-	pendingCount := len(e.pending)
+	e.pending = pending
 	quiet := e.cfg.InQuietHours(time.Now())
 	if quiet {
 		e.quietBuffered = true
 	}
 	e.mu.Unlock()
-
-	slog.Info("pending update recorded", "id", id, "image", ev.Image, "digest", shortDigest(ev.Digest), "pending_total", pendingCount, "quiet_hours", quiet)
-
-	if quiet {
-		slog.Info("quiet hours active; notification deferred", "quiet_hours", e.cfg.QuietHours)
-		return
+	if !quiet {
+		e.armCoalesce()
 	}
-	e.armCoalesce()
+	return nil
+}
+
+func containerName(ev diun.Event) string {
+	name, _, _ := strings.Cut(ev.Metadata["ctn_names"], ",")
+	return strings.TrimPrefix(strings.TrimSpace(name), "/")
+}
+
+func (e *Engine) setLatestLocked(chat, msg int64) {
+	if e.latest[chat] != msg {
+		delete(e.confirmations, chat)
+		e.latest[chat] = msg
+		if err := e.db.SetLatest(chat, msg); err != nil {
+			slog.Error("save latest Telegram message", "err", err)
+		}
+	}
 }
 
 func (e *Engine) armCoalesce() {
 	e.mu.Lock()
-	if e.coalesceArmed || e.running {
+	if e.coalesceArmed || e.running || e.paused {
 		e.mu.Unlock()
 		return
 	}
@@ -193,50 +196,42 @@ func (e *Engine) armCoalesce() {
 }
 
 func (e *Engine) notifyPending() {
-	targets := e.cfg.NotifyTargets()
-	if len(targets) == 0 {
-		slog.Warn("no telegram notify targets configured; update stored but not sent")
+	e.mu.Lock()
+	if e.running || e.paused || len(e.pending) == 0 {
+		e.mu.Unlock()
 		return
 	}
-	e.mu.Lock()
 	text := e.pendingTextLocked()
 	buttons := e.pendingButtonsLocked()
-	pendingCount := len(e.pending)
 	e.mu.Unlock()
 
-	ctx := context.Background()
-	e.mu.Lock()
-	prevChat, prevMsg := e.latestChat, e.latestMsg
-	e.latestChat, e.latestMsg = 0, 0
-	e.mu.Unlock()
-	if prevChat != 0 && prevMsg != 0 {
-		if err := e.bot.Delete(ctx, prevChat, prevMsg); err != nil {
-			slog.Debug("delete previous notification", "chat", prevChat, "message", prevMsg, "err", err)
+	ctx, cancel := context.WithTimeout(e.workCtx, 30*time.Second)
+	defer cancel()
+	for _, chat := range e.cfg.NotifyTargets() {
+		e.mu.Lock()
+		previous := e.latest[chat]
+		confirming := e.confirmations[chat].token != ""
+		e.mu.Unlock()
+		if confirming {
+			continue
 		}
-		_ = e.db.ClearLatest()
-	}
-	var lastChat, lastMsg int64
-	sent := 0
-	for _, chat := range targets {
 		id, err := e.bot.Send(ctx, chat, text, buttons)
 		if err != nil {
 			slog.Error("telegram notify failed", "chat", chat, "err", err)
 			continue
 		}
-		slog.Info("telegram notify sent", "chat", chat, "message", id, "pending", pendingCount)
-		lastChat, lastMsg = chat, id
-		sent++
+		e.mu.Lock()
+		if e.running || e.paused || e.latest[chat] != previous || e.confirmations[chat].token != "" {
+			e.mu.Unlock()
+			_ = e.bot.StripButtons(ctx, chat, id)
+			continue
+		}
+		e.setLatestLocked(chat, id)
+		e.mu.Unlock()
+		if previous != 0 {
+			_ = e.bot.StripButtons(ctx, chat, previous)
+		}
 	}
-	if lastChat == 0 {
-		slog.Error("telegram notify failed for all targets", "targets", len(targets))
-		return
-	}
-	e.mu.Lock()
-	e.latestChat = lastChat
-	e.latestMsg = lastMsg
-	e.mu.Unlock()
-	_ = e.db.SetLatest(lastChat, lastMsg)
-	slog.Info("latest actionable notification set", "chat", lastChat, "message", lastMsg, "delivered", sent)
 }
 
 func (e *Engine) pendingTextLocked() string {
@@ -358,15 +353,25 @@ func (e *Engine) Handle(ctx context.Context, api *telegram.API, chatID int64, ms
 		id, err := api.Send(ctx, chatID, b.String(), buttons)
 		if err == nil && len(buttons) > 0 {
 			e.mu.Lock()
-			e.latestChat, e.latestMsg = chatID, id
+			busy := e.running
+			if !busy {
+				e.setLatestLocked(chatID, id)
+			}
 			e.mu.Unlock()
-			_ = e.db.SetLatest(chatID, id)
+			if busy {
+				_ = api.StripButtons(ctx, chatID, id)
+			}
 		}
 		return
 	}
 	if text == "/updates" || text == "/update" {
 		e.mu.Lock()
-		if len(e.pending) == 0 {
+		if e.running {
+			e.mu.Unlock()
+			_, _ = api.Send(ctx, chatID, "An update is running. Use /status or the active update card.", nil)
+			return
+		}
+		if len(e.pending) == 0 && !e.paused {
 			e.mu.Unlock()
 			_, _ = api.Send(ctx, chatID, msgHeader("✅ <b>No pending updates</b>")+
 				"Nothing waiting right now.\nDiun will notify when an image digest changes.\n\n"+
@@ -375,18 +380,20 @@ func (e *Engine) Handle(ctx context.Context, api *telegram.API, chatID int64, ms
 		}
 		textMsg := e.pendingTextLocked()
 		buttons := e.pendingButtonsLocked()
-		prevC, prevM := e.latestChat, e.latestMsg
+		if paused, jobs, index := e.db.GetQueuePaused(); e.paused && paused && index >= 0 && index < len(jobs) {
+			textMsg = formatRecovery(len(jobs) - index)
+			buttons = pausedButtons()
+		}
+		prevM := e.latest[chatID]
 		e.mu.Unlock()
-		if prevC != 0 && prevM != 0 {
-			_ = api.StripButtons(ctx, prevC, prevM)
+		if prevM != 0 {
+			_ = api.StripButtons(ctx, chatID, prevM)
 		}
 		id, err := api.Send(ctx, chatID, textMsg, buttons)
 		if err == nil {
 			e.mu.Lock()
-			e.latestChat = chatID
-			e.latestMsg = id
+			e.setLatestLocked(chatID, id)
 			e.mu.Unlock()
-			_ = e.db.SetLatest(chatID, id)
 		}
 		return
 	}
@@ -395,107 +402,95 @@ func (e *Engine) Handle(ctx context.Context, api *telegram.API, chatID int64, ms
 		return
 	}
 
-	// Latest notification rule: reject obsolete callbacks (spec §9).
+	// Message IDs are scoped to their chat.
 	e.mu.Lock()
-	latestMsg := e.latestMsg
+	latestMsg := e.latest[chatID]
+	busy := e.running
+	paused := e.paused
 	e.mu.Unlock()
-	if latestMsg != 0 && msgID != 0 && msgID != latestMsg {
+	if chatID == 0 || msgID == 0 || msgID != latestMsg {
 		slog.Warn("obsolete notification callback rejected", "user", fromID, "message", msgID, "latest", latestMsg, "callback", callback)
 		api.Answer(ctx, callbackID, "Obsolete notification — use the latest message")
 		return
 	}
 
-	switch {
-	case callback == "skip_all":
-		api.Answer(ctx, callbackID, "Skipped")
-		e.mu.Lock()
-		n := len(e.pending)
-		images := make([]string, 0, n)
-		for _, p := range e.pending {
-			images = append(images, p.Event.Image)
-			_ = e.db.SetStatus(p.RecordID, store.StatusSkipped, "")
-		}
-		e.pending = nil
-		e.selectMode = false
-		_ = e.db.SetPending(nil)
-		_ = e.db.SetSelectMode(false)
-		e.mu.Unlock()
-		slog.Info("updates skipped", "user", fromID, "count", n)
-		_ = api.Edit(ctx, chatID, msgID, formatSkipped(images), [][]telegram.Button{})
+	if busy && callback != "queue_pause" && callback != "queue_cancel" {
+		api.Answer(ctx, callbackID, "An update is already running")
 		return
+	}
+	if paused && (callback == "skip_all" || callback == "skip_selected" || callback == "select_on" || callback == "select_off" || strings.HasPrefix(callback, "toggle_") || strings.HasPrefix(callback, "confirm_")) {
+		api.Answer(ctx, callbackID, "Resolve the paused queue first using /updates")
+		return
+	}
 
-	case callback == "skip_selected":
-		api.Answer(ctx, callbackID, "Skipped selected")
+	switch {
+	case callback == "skip_all" || callback == "skip_selected":
 		e.mu.Lock()
 		var images []string
-		remain := make([]store.PendingItem, 0)
-		for _, p := range e.pending {
-			if p.Selected {
-				images = append(images, p.Event.Image)
-				_ = e.db.SetStatus(p.RecordID, store.StatusSkipped, "")
-				continue
+		var ids []int64
+		for _, item := range e.pending {
+			if callback == "skip_all" || item.Selected {
+				images = append(images, item.Event.Image)
+				ids = append(ids, item.RecordID)
 			}
-			remain = append(remain, p)
 		}
-		e.pending = remain
-		e.selectMode = false
-		_ = e.db.SetPending(remain)
-		_ = e.db.SetSelectMode(false)
-		textMsg := e.pendingTextLocked()
-		buttons := e.pendingButtonsLocked()
-		e.mu.Unlock()
-		if len(images) == 0 {
-			_ = api.Edit(ctx, chatID, msgID, textMsg, buttons)
+		remain := withoutJobs(e.pending, ids)
+		if e.running || e.paused || e.latest[chatID] != msgID {
+			e.mu.Unlock()
+			api.Answer(ctx, callbackID, "Queue changed; open /updates")
 			return
 		}
+		if err := e.db.SaveQueue(remain, nil, 0, false, ids, store.StatusSkipped); err != nil {
+			e.mu.Unlock()
+			slog.Error("save skipped jobs", "err", err)
+			api.Answer(ctx, callbackID, "Could not save skipped jobs")
+			return
+		}
+		clear(e.confirmations)
+		e.pending, e.selectMode = remain, false
+		text, buttons := e.pendingTextLocked(), e.pendingButtonsLocked()
+		e.mu.Unlock()
+		api.Answer(ctx, callbackID, "Skipped")
 		if len(remain) == 0 {
-			_ = api.Edit(ctx, chatID, msgID, formatSkipped(images), [][]telegram.Button{})
+			text, buttons = formatSkipped(images), [][]telegram.Button{}
+		}
+		_ = api.Edit(ctx, chatID, msgID, text, buttons)
+		return
+
+	case callback == "select_on" || callback == "select_off" || strings.HasPrefix(callback, "toggle_"):
+		e.mu.Lock()
+		pending := append([]store.PendingItem(nil), e.pending...)
+		selectMode := e.selectMode
+		if strings.HasPrefix(callback, "toggle_") {
+			index, err := strconv.Atoi(strings.TrimPrefix(callback, "toggle_"))
+			if err != nil || !selectMode || index < 0 || index >= len(pending) {
+				e.mu.Unlock()
+				api.Answer(ctx, callbackID, "Selection changed; open /updates")
+				return
+			}
+			pending[index].Selected = !pending[index].Selected
+		} else {
+			selectMode = callback == "select_on"
+			for i := range pending {
+				pending[i].Selected = !selectMode
+			}
+		}
+		if e.running || e.paused || e.latest[chatID] != msgID {
+			e.mu.Unlock()
+			api.Answer(ctx, callbackID, "Queue changed; open /updates")
 			return
 		}
-		_ = api.Edit(ctx, chatID, msgID, textMsg, buttons)
-		return
-
-	case callback == "select_on":
-		api.Answer(ctx, callbackID, "Select mode")
-		e.mu.Lock()
-		e.selectMode = true
-		for i := range e.pending {
-			e.pending[i].Selected = false
+		if err := e.db.SaveQueue(pending, nil, 0, selectMode, nil, ""); err != nil {
+			e.mu.Unlock()
+			slog.Error("save selection", "err", err)
+			api.Answer(ctx, callbackID, "Could not save selection")
+			return
 		}
-		_ = e.db.SetSelectMode(true)
-		_ = e.db.SetPending(e.pending)
-		textMsg := e.pendingTextLocked()
-		buttons := e.pendingButtonsLocked()
+		delete(e.confirmations, chatID)
+		e.pending, e.selectMode = pending, selectMode
+		textMsg, buttons := e.pendingTextLocked(), e.pendingButtonsLocked()
 		e.mu.Unlock()
-		_ = api.Edit(ctx, chatID, msgID, textMsg, buttons)
-		return
-
-	case callback == "select_off":
 		api.Answer(ctx, callbackID, "")
-		e.mu.Lock()
-		e.selectMode = false
-		for i := range e.pending {
-			e.pending[i].Selected = true
-		}
-		_ = e.db.SetSelectMode(false)
-		_ = e.db.SetPending(e.pending)
-		textMsg := e.pendingTextLocked()
-		buttons := e.pendingButtonsLocked()
-		e.mu.Unlock()
-		_ = api.Edit(ctx, chatID, msgID, textMsg, buttons)
-		return
-
-	case strings.HasPrefix(callback, "toggle_"):
-		api.Answer(ctx, callbackID, "")
-		idx, _ := strconv.Atoi(strings.TrimPrefix(callback, "toggle_"))
-		e.mu.Lock()
-		if idx >= 0 && idx < len(e.pending) {
-			e.pending[idx].Selected = !e.pending[idx].Selected
-			_ = e.db.SetPending(e.pending)
-		}
-		textMsg := e.pendingTextLocked()
-		buttons := e.pendingButtonsLocked()
-		e.mu.Unlock()
 		_ = api.Edit(ctx, chatID, msgID, textMsg, buttons)
 		return
 
@@ -503,13 +498,13 @@ func (e *Engine) Handle(ctx context.Context, api *telegram.API, chatID int64, ms
 		e.showConfirmation(ctx, api, chatID, msgID, callbackID, callback)
 		return
 
-	case callback == "start_all" || callback == "start_selected" || callback == "start_next":
-		e.startQueue(ctx, api, chatID, msgID, callbackID, callback)
+	case strings.HasPrefix(callback, "start_"):
+		e.startQueue(ctx, api, chatID, msgID, callbackID, strings.TrimPrefix(callback, "start_"))
 		return
 
 	case callback == "queue_pause":
 		e.mu.Lock()
-		if !e.running {
+		if !e.running || e.activeChat != chatID || e.activeMsg != msgID {
 			e.mu.Unlock()
 			api.Answer(ctx, callbackID, "Not running")
 			return
@@ -521,7 +516,7 @@ func (e *Engine) Handle(ctx context.Context, api *telegram.API, chatID int64, ms
 
 	case callback == "queue_cancel":
 		e.mu.Lock()
-		if !e.running {
+		if !e.running || e.activeChat != chatID || e.activeMsg != msgID {
 			e.mu.Unlock()
 			api.Answer(ctx, callbackID, "Not running")
 			return
@@ -538,129 +533,15 @@ func (e *Engine) Handle(ctx context.Context, api *telegram.API, chatID int64, ms
 	case callback == "cancel_confirm":
 		api.Answer(ctx, callbackID, "Cancelled")
 		e.mu.Lock()
+		delete(e.confirmations, chatID)
 		textMsg := e.pendingTextLocked()
 		buttons := e.pendingButtonsLocked()
 		e.mu.Unlock()
 		_ = api.Edit(ctx, chatID, msgID, textMsg, buttons)
 		return
 
-	case callback == "queue_continue":
-		api.Answer(ctx, callbackID, "Continuing")
-		e.mu.Lock()
-		if e.running {
-			e.mu.Unlock()
-			slog.Warn("continue ignored: queue already running")
-			return
-		}
-		paused, jobs, idx := e.db.GetQueuePaused()
-		if !paused || len(jobs) == 0 {
-			e.mu.Unlock()
-			slog.Warn("continue ignored: nothing paused")
-			return
-		}
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= len(jobs) {
-			e.paused = false
-			_ = e.db.SetQueuePaused(false, nil, 0)
-			e.mu.Unlock()
-			slog.Info("paused queue already finished")
-			return
-		}
-		remain := jobs[idx:]
-		e.running = true
-		e.paused = false
-		_ = e.db.SetQueuePaused(false, nil, 0)
-		e.mu.Unlock()
-		slog.Info("queue continued", "remaining", len(remain), "from_index", idx+1)
-		go e.runQueue(e.workCtx, api, chatID, msgID, remain, 0)
-		return
-
-	case callback == "queue_skip_continue":
-		api.Answer(ctx, callbackID, "Skipped failed, continuing")
-		e.mu.Lock()
-		if e.running {
-			e.mu.Unlock()
-			return
-		}
-		paused, jobs, idx := e.db.GetQueuePaused()
-		if !paused || len(jobs) == 0 || idx < 0 || idx >= len(jobs) {
-			e.mu.Unlock()
-			return
-		}
-		failed := jobs[idx]
-		_ = e.db.SetStatus(failed.RecordID, store.StatusSkipped, "skipped after failure")
-		next := idx + 1
-		if next >= len(jobs) {
-			e.paused = false
-			e.pending = nil
-			_ = e.db.SetQueuePaused(false, nil, 0)
-			_ = e.db.SetPending(nil)
-			e.mu.Unlock()
-			_ = api.Edit(ctx, chatID, msgID, formatSkipped([]string{failed.Event.Image}), [][]telegram.Button{})
-			return
-		}
-		remain := jobs[next:]
-		e.running = true
-		e.paused = false
-		_ = e.db.SetQueuePaused(false, nil, 0)
-		e.mu.Unlock()
-		slog.Info("skipped failed job; continuing", "skipped", failed.Event.Image, "remaining", len(remain))
-		go e.runQueue(e.workCtx, api, chatID, msgID, remain, 0)
-		return
-
-	case callback == "queue_stop":
-		api.Answer(ctx, callbackID, "Stopped")
-		e.mu.Lock()
-		paused, jobs, idx := e.db.GetQueuePaused()
-		var done, remaining []queueResult
-		var keep []store.PendingItem
-		if paused && len(jobs) > 0 {
-			if idx < 0 {
-				idx = 0
-			}
-			if idx > len(jobs) {
-				idx = len(jobs)
-			}
-			for i, j := range jobs {
-				r := queueResult{Image: j.Event.Image}
-				if i < idx {
-					done = append(done, r)
-					continue
-				}
-				remaining = append(remaining, r)
-				j.Selected = true
-				keep = append(keep, j)
-				_ = e.db.SetStatus(j.RecordID, store.StatusPending, "stopped; still pending")
-			}
-		} else {
-			keep = append(keep, e.pending...)
-			for _, p := range keep {
-				remaining = append(remaining, queueResult{Image: p.Event.Image})
-			}
-		}
-		e.paused = false
-		e.selectMode = false
-		e.pending = keep
-		_ = e.db.SetQueuePaused(false, nil, 0)
-		_ = e.db.SetPending(keep)
-		_ = e.db.SetSelectMode(false)
-		textMsg := formatQueueStopped(done, remaining)
-		var buttons [][]telegram.Button
-		if len(keep) > 0 {
-			textMsg += "\nThese stay pending. Use the buttons below, or /updates later.\n"
-			buttons = e.pendingButtonsLocked()
-		}
-		e.mu.Unlock()
-		slog.Info("queue stopped by user", "user", fromID, "done", len(done), "still_pending", len(keep))
-		_ = api.Edit(ctx, chatID, msgID, textMsg, buttons)
-		if len(keep) > 0 {
-			e.mu.Lock()
-			e.latestChat, e.latestMsg = chatID, msgID
-			e.mu.Unlock()
-			_ = e.db.SetLatest(chatID, msgID)
-		}
+	case callback == "queue_continue" || callback == "queue_skip_continue" || callback == "queue_stop":
+		e.pausedQueueAction(ctx, api, chatID, msgID, callbackID, callback)
 		return
 
 	case callback == "show_logs":
@@ -723,7 +604,9 @@ func (e *Engine) Handle(ctx context.Context, api *telegram.API, chatID int64, ms
 				"ctn_names": rec.ContainerName,
 			},
 		}
-		e.DiunEvent(ev)
+		if err := e.DiunEvent(ev); err != nil {
+			_, _ = api.Send(ctx, chatID, "Could not queue retry: "+htmlEscape(err.Error()), nil)
+		}
 		return
 
 	case strings.HasPrefix(callback, "hist_logs_"):
@@ -771,71 +654,196 @@ func (e *Engine) showConfirmation(ctx context.Context, api *telegram.API, chatID
 	jobs := e.jobsForCallback(kind)
 	if len(jobs) == 0 {
 		api.Answer(ctx, callbackID, "Nothing to update")
-		slog.Info("confirmation skipped: nothing to update", "kind", kind, "user_chat", chatID)
 		return
 	}
-	api.Answer(ctx, callbackID, "")
-	slog.Info("showing confirmation screen", "kind", kind, "jobs", len(jobs), "chat", chatID)
-	startCB := "start_all"
-	switch kind {
-	case "confirm_selected":
-		startCB = "start_selected"
-	case "confirm_next":
-		startCB = "start_next"
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		api.Answer(ctx, callbackID, "Could not create confirmation")
+		return
 	}
+	token := hex.EncodeToString(id[:])
 	buttons := [][]telegram.Button{
-		{{Text: "🚀 START UPDATE", CallbackData: startCB}},
+		{{Text: "🚀 START UPDATE", CallbackData: "start_" + token}},
 		{{Text: "❌ CANCEL", CallbackData: "cancel_confirm"}},
 	}
-	_ = api.Edit(ctx, chatID, msgID, formatConfirmation(jobs), buttons)
+	api.Answer(ctx, callbackID, "")
 	e.mu.Lock()
-	e.latestChat = chatID
-	e.latestMsg = msgID
+	if !e.running && !e.paused && e.latest[chatID] == msgID {
+		e.confirmations[chatID] = confirmation{token: token, jobs: jobs}
+	}
 	e.mu.Unlock()
-	_ = e.db.SetLatest(chatID, msgID)
+	if err := api.Edit(ctx, chatID, msgID, formatConfirmation(jobs), buttons); err != nil {
+		e.mu.Lock()
+		if e.confirmations[chatID].token == token {
+			delete(e.confirmations, chatID)
+		}
+		e.mu.Unlock()
+	}
 }
 
-func (e *Engine) startQueue(ctx context.Context, api *telegram.API, chatID, msgID int64, callbackID, kind string) {
-	jobs := e.jobsForCallback(kind)
+func (e *Engine) startQueue(ctx context.Context, api *telegram.API, chatID, msgID int64, callbackID, token string) {
+	jobs, err := e.acceptConfirmation(chatID, msgID, token)
+	if err != nil {
+		api.Answer(ctx, callbackID, err.Error())
+		return
+	}
+	api.Answer(ctx, callbackID, "Update queue started")
+	go e.runQueue(e.workCtx, api, chatID, msgID, jobs)
+}
+
+func (e *Engine) acceptConfirmation(chat, msg int64, token string) ([]store.PendingItem, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.running {
+		return nil, errors.New("an update is already running")
+	}
+	if e.paused {
+		return nil, errors.New("resolve the paused queue first using /updates")
+	}
+	approved := e.confirmations[chat]
+	if token == "" || approved.token != token || e.latest[chat] != msg {
+		return nil, errors.New("confirmation expired; open /updates")
+	}
+	ids := make([]int64, 0, len(approved.jobs))
+	for _, job := range approved.jobs {
+		if job.Event.DigestRef() == "" {
+			return nil, errors.New("detected digest missing; refresh the update via Diun")
+		}
+		ids = append(ids, job.RecordID)
+	}
+	remain := withoutJobs(e.pending, ids)
+	if len(e.pending)-len(remain) != len(ids) {
+		delete(e.confirmations, chat)
+		return nil, errors.New("updates changed; open /updates and confirm again")
+	}
+	if err := e.db.SaveQueue(remain, approved.jobs, 0, false, ids, store.StatusQueued); err != nil {
+		slog.Error("save queue start", "err", err)
+		return nil, errors.New("could not save queue")
+	}
+	clear(e.confirmations)
+	e.pending = remain
+	e.running, e.paused, e.selectMode = true, false, false
+	e.activeChat, e.activeMsg = chat, msg
+	return approved.jobs, nil
+}
+
+func withoutJobs(pending []store.PendingItem, ids []int64) []store.PendingItem {
+	remove := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		remove[id] = true
+	}
+	remain := make([]store.PendingItem, 0, len(pending))
+	for _, job := range pending {
+		if !remove[job.RecordID] {
+			remain = append(remain, job)
+		}
+	}
+	return remain
+}
+
+func (e *Engine) pausedQueueAction(ctx context.Context, api *telegram.API, chat, msg int64, callbackID, action string) {
 	e.mu.Lock()
 	if e.running {
 		e.mu.Unlock()
 		api.Answer(ctx, callbackID, "An update is already running")
-		slog.Warn("queue start rejected: already running", "kind", kind)
 		return
 	}
-	if len(jobs) == 0 {
+	_, previous, index := e.db.GetQueuePaused()
+	jobs, pending, err := e.resumePausedLocked(action)
+	if err != nil {
 		e.mu.Unlock()
-		api.Answer(ctx, callbackID, "Nothing to update")
-		slog.Warn("queue start rejected: empty", "kind", kind)
+		api.Answer(ctx, callbackID, err.Error())
 		return
 	}
-	// Remove selected jobs from pending; keep unselected.
-	jobSet := map[int64]bool{}
-	for _, j := range jobs {
-		jobSet[j.RecordID] = true
-		_ = e.db.SetStatus(j.RecordID, store.StatusQueued, "")
+	if len(jobs) > 0 {
+		e.running = true
+		e.activeChat, e.activeMsg = chat, msg
 	}
-	remain := make([]store.PendingItem, 0)
-	for _, p := range e.pending {
-		if !jobSet[p.RecordID] {
-			remain = append(remain, p)
+	text, buttons := e.pendingTextLocked(), e.pendingButtonsLocked()
+	if action == "queue_stop" {
+		done := make([]queueResult, 0, index)
+		for _, item := range previous[:index] {
+			done = append(done, queueResult{Image: item.Event.Image})
+		}
+		remaining := make([]queueResult, 0, len(pending))
+		for _, item := range pending {
+			remaining = append(remaining, queueResult{Image: item.Event.Image})
+		}
+		text = formatQueueStopped(done, remaining)
+	}
+	if len(pending) == 0 {
+		buttons = [][]telegram.Button{}
+	}
+	e.mu.Unlock()
+	api.Answer(ctx, callbackID, "")
+	if len(jobs) > 0 {
+		go e.runQueue(e.workCtx, api, chat, msg, jobs)
+		return
+	}
+	_ = api.Edit(ctx, chat, msg, text, buttons)
+}
+
+// resumePausedLocked updates the paused batch and pending list together.
+func (e *Engine) resumePausedLocked(action string) ([]store.PendingItem, []store.PendingItem, error) {
+	paused, jobs, idx := e.db.GetQueuePaused()
+	if !paused || idx < 0 || idx >= len(jobs) {
+		return nil, nil, errors.New("no paused queue")
+	}
+	jobs = jobs[idx:]
+	pending := e.pending
+	var skip []int64
+	if action == "queue_skip_continue" {
+		skip = []int64{jobs[0].RecordID}
+		pending = withoutJobs(pending, skip)
+		jobs = jobs[1:]
+	}
+	if action == "queue_stop" {
+		pending = mergePending(pending, jobs)
+		if err := e.db.SaveQueue(pending, nil, 0, false, jobIDs(jobs), store.StatusPending); err != nil {
+			slog.Error("save stopped queue", "err", err)
+			return nil, nil, errors.New("could not save stopped queue")
+		}
+		jobs = nil
+	} else {
+		if err := e.db.SaveQueue(pending, jobs, 0, false, skip, store.StatusSkipped); err != nil {
+			slog.Error("save resumed queue", "err", err)
+			return nil, nil, errors.New("could not save resumed queue")
 		}
 	}
-	e.pending = remain
-	_ = e.db.SetPending(remain)
-	e.running = true
-	e.paused = false
-	e.selectMode = false
-	_ = e.db.SetSelectMode(false)
-	_ = e.db.SetQueuePaused(false, nil, 0)
-	e.mu.Unlock()
-	api.Answer(ctx, callbackID, "Update queue started")
-	slog.Info("update queue started", "kind", kind, "jobs", len(jobs), "chat", chatID)
-	for i, j := range jobs {
-		slog.Info("queue job", "index", i+1, "of", len(jobs), "id", j.RecordID, "image", j.Event.Image)
+	e.pending, e.paused, e.selectMode = pending, false, false
+	return jobs, pending, nil
+}
+
+func jobIDs(jobs []store.PendingItem) []int64 {
+	ids := make([]int64, 0, len(jobs))
+	for _, job := range jobs {
+		ids = append(ids, job.RecordID)
 	}
-	go e.runQueue(e.workCtx, api, chatID, msgID, jobs, 0)
+	return ids
+}
+
+func mergePending(pending, jobs []store.PendingItem) []store.PendingItem {
+	out := append([]store.PendingItem(nil), pending...)
+	for _, job := range jobs {
+		found := false
+		for _, item := range out {
+			if item.RecordID == job.RecordID || (dockerapi.SameImageRef(item.Event.Image, job.Event.Image) && containerName(item.Event) == containerName(job.Event)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, job)
+		}
+	}
+	return out
+}
+
+func pausedButtons() [][]telegram.Button {
+	return [][]telegram.Button{
+		{{Text: "📋 LOGS", CallbackData: "show_logs"}, {Text: "🔁 RETRY", CallbackData: "queue_continue"}},
+		{{Text: "⏭ SKIP & CONTINUE", CallbackData: "queue_skip_continue"}, {Text: "⏹️ STOP", CallbackData: "queue_stop"}},
+	}
 }
 
 func (e *Engine) processingButtons() [][]telegram.Button {
@@ -852,37 +860,26 @@ func (e *Engine) userCancelled() bool {
 }
 
 // holdPending puts unfinished jobs back on the idle pending list.
-func (e *Engine) holdPending(jobs []store.PendingItem) {
-	keep := make([]store.PendingItem, 0, len(jobs))
-	seen := map[int64]bool{}
-	for _, j := range jobs {
-		j.Selected = true
-		keep = append(keep, j)
-		seen[j.RecordID] = true
-		_ = e.db.SetStatus(j.RecordID, store.StatusPending, "still pending")
-	}
+func (e *Engine) holdPending(jobs []store.PendingItem) error {
 	e.mu.Lock()
-	for _, p := range e.pending {
-		if !seen[p.RecordID] {
-			keep = append(keep, p)
-		}
+	defer e.mu.Unlock()
+	keep := mergePending(e.pending, jobs)
+	if err := e.db.SaveQueue(keep, nil, 0, false, jobIDs(jobs), store.StatusPending); err != nil {
+		e.paused = true
+		return err
 	}
-	e.paused = false
-	e.selectMode = false
-	e.pauseAfter = false
+	e.paused, e.selectMode, e.pauseAfter = false, false, false
 	e.pending = keep
-	e.mu.Unlock()
-	_ = e.db.SetQueuePaused(false, nil, 0)
-	_ = e.db.SetPending(keep)
-	_ = e.db.SetSelectMode(false)
+	return nil
 }
 
-func (e *Engine) runQueue(ctx context.Context, api *telegram.API, chat, msg int64, jobs []store.PendingItem, startIdx int) {
+func (e *Engine) runQueue(ctx context.Context, api *telegram.API, chat, msg int64, jobs []store.PendingItem) {
 	runCtx, runCancel := context.WithCancel(ctx)
 	e.mu.Lock()
 	e.runCancel = runCancel
-	e.pauseAfter = false
-	e.cancelRun = false
+	if e.cancelRun {
+		runCancel()
+	}
 	e.mu.Unlock()
 	defer func() {
 		runCancel()
@@ -893,70 +890,59 @@ func (e *Engine) runQueue(ctx context.Context, api *telegram.API, chat, msg int6
 		e.pauseAfter = false
 		e.cancelRun = false
 		e.running = false
+		e.activeChat, e.activeMsg = 0, 0
 		e.mu.Unlock()
 		slog.Info("update queue idle")
+		e.armCoalesce()
 	}()
 	queueStart := time.Now()
 	done := make([]queueResult, 0, len(jobs))
-	// Preserve successes from earlier steps when continuing a paused queue.
-	for i := 0; i < startIdx && i < len(jobs); i++ {
-		done = append(done, queueResult{Image: jobs[i].Event.Image})
-	}
-	slog.Info("processing queue", "jobs", len(jobs), "start_index", startIdx+1)
-	for i := startIdx; i < len(jobs); i++ {
+	slog.Info("processing queue", "jobs", len(jobs))
+	for i, j := range jobs {
 		e.mu.Lock()
 		pause := e.pauseAfter
 		e.mu.Unlock()
 		if pause {
-			e.holdPending(jobs[i:])
+			if err := e.holdPending(jobs[i:]); err != nil {
+				slog.Error("could not save unfinished queue", "err", err)
+				e.showHeld(ctx, api, chat, msg, "❌ <b>Queue save failed</b>", "Check the bot logs before continuing.")
+				return
+			}
 			e.showHeld(ctx, api, chat, msg, "⏸ <b>Queue paused</b>", "Paused after the current image. These are still pending.")
 			return
 		}
-		j := jobs[i]
 		slog.Info("queue step begin", "step", i+1, "of", len(jobs), "image", j.Event.Image, "id", j.RecordID)
 		res, err := e.runOne(ctx, runCtx, api, chat, msg, i+1, len(jobs), j)
-		if err != nil && errors.Is(err, errUserCancel) {
-			e.holdPending(jobs[i:])
+		if err != nil && (errors.Is(err, errUserCancel) || e.userCancelled()) {
+			if err := e.holdPending(jobs[i:]); err != nil {
+				slog.Error("could not save unfinished queue", "err", err)
+				e.showHeld(ctx, api, chat, msg, "❌ <b>Queue save failed</b>", "Check the bot logs before continuing.")
+				return
+			}
 			e.showHeld(ctx, api, chat, msg, "❌ <b>Update cancelled</b>", "Stopped in progress. These are still pending.")
 			return
 		}
-		if err != nil && errors.Is(err, errSkipJob) {
-			slog.Info("queue step skipped", "image", j.Event.Image, "err", err)
-			_ = e.db.SetStatus(j.RecordID, store.StatusSkipped, err.Error())
-			e.mu.Lock()
-			filtered := e.pending[:0]
-			for _, p := range e.pending {
-				if p.RecordID != j.RecordID {
-					filtered = append(filtered, p)
-				}
+		if errors.Is(err, errSkipJob) {
+			if saveErr := e.finishJob(j, jobs, i+1, store.StatusSkipped); saveErr != nil {
+				err = saveErr
+			} else {
+				continue
 			}
-			e.pending = filtered
-			_ = e.db.SetPending(e.pending)
-			e.mu.Unlock()
-			continue
 		}
 		if err != nil {
 			res.Err = err
-			e.lastFailID = j.RecordID
-			remain := jobs[i:] // include failed + waiting
-			e.mu.Lock()
-			e.paused = true
-			merged := append([]store.PendingItem(nil), remain...)
-			for _, p := range e.pending {
-				dup := false
-				for _, r := range merged {
-					if r.RecordID == p.RecordID {
-						dup = true
-						break
-					}
-				}
-				if !dup {
-					merged = append(merged, p)
-				}
+			if saveErr := e.db.SetStatus(j.RecordID, store.StatusFailed, err.Error()); saveErr != nil {
+				slog.Error("save failed job", "err", saveErr)
 			}
-			e.pending = merged
-			_ = e.db.SetPending(e.pending)
-			_ = e.db.SetQueuePaused(true, jobs, i)
+			e.mu.Lock()
+			e.lastFailID = j.RecordID
+			e.paused = true
+			merged := mergePending(e.pending, jobs[i:])
+			if saveErr := e.db.SaveQueue(merged, jobs, i, false, nil, ""); saveErr != nil {
+				slog.Error("save paused queue", "err", saveErr)
+			} else {
+				e.pending = merged
+			}
 			e.mu.Unlock()
 			waiting := make([]queueResult, 0, len(jobs)-i-1)
 			for k := i + 1; k < len(jobs); k++ {
@@ -965,62 +951,50 @@ func (e *Engine) runQueue(ctx context.Context, api *telegram.API, chat, msg int6
 			slog.Error("update failed; queue paused",
 				"image", j.Event.Image, "id", j.RecordID, "err", err,
 				"completed", len(done), "waiting", len(waiting))
-			buttons := [][]telegram.Button{
-				{
-					{Text: "📋 LOGS", CallbackData: "show_logs"},
-					{Text: "🔁 RETRY", CallbackData: "queue_continue"},
-				},
-				{
-					{Text: "⏭ SKIP & CONTINUE", CallbackData: "queue_skip_continue"},
-					{Text: "⏹️ STOP", CallbackData: "queue_stop"},
-				},
-			}
-			_ = api.Edit(ctx, chat, msg, formatQueueFailed(res, done, waiting), buttons)
+			_ = api.Edit(ctx, chat, msg, formatQueueFailed(res, done, waiting), pausedButtons())
 			e.mu.Lock()
-			e.latestChat, e.latestMsg = chat, msg
+			e.setLatestLocked(chat, msg)
 			e.mu.Unlock()
-			_ = e.db.SetLatest(chat, msg)
+			return
+		}
+		if err := e.finishJob(j, jobs, i+1, store.StatusSuccess); err != nil {
+			slog.Error("save completed update", "err", err)
+			e.showHeld(ctx, api, chat, msg, "❌ <b>Queue save failed</b>", "Check the bot logs before continuing.")
 			return
 		}
 		done = append(done, res)
+		_ = api.Edit(ctx, chat, msg, formatStepSuccess(i+1, len(jobs), res), e.processingButtons())
 		e.mu.Lock()
 		e.lastSuccessID = res.RecordID
-		e.mu.Unlock()
-		slog.Info("queue step success", "step", i+1, "of", len(jobs), "image", j.Event.Image)
-		e.mu.Lock()
-		filtered := e.pending[:0]
-		for _, p := range e.pending {
-			if p.RecordID != j.RecordID {
-				filtered = append(filtered, p)
-			}
-		}
-		e.pending = filtered
-		_ = e.db.SetPending(e.pending)
 		e.mu.Unlock()
 		e.mu.Lock()
 		pause = e.pauseAfter
 		e.mu.Unlock()
 		if pause && i+1 < len(jobs) {
-			e.holdPending(jobs[i+1:])
+			if err := e.holdPending(jobs[i+1:]); err != nil {
+				slog.Error("could not save unfinished queue", "err", err)
+				e.showHeld(ctx, api, chat, msg, "❌ <b>Queue save failed</b>", "Check the bot logs before continuing.")
+				return
+			}
 			e.showHeld(ctx, api, chat, msg, "⏸ <b>Queue paused</b>", "Paused after the current image. These are still pending.")
 			return
 		}
 	}
 	slog.Info("update queue complete", "jobs", len(jobs), "succeeded", len(done))
 	buttons := [][]telegram.Button{}
-	if e.lastSuccessID != 0 {
-		if r, ok := e.db.Get(e.lastSuccessID); ok && r.PreviousDigest != "" && r.ContainerName != "" {
+	if len(done) > 0 {
+		id := done[len(done)-1].RecordID
+		if r, ok := e.db.Get(id); ok && r.PreviousDigest != "" && r.ContainerName != "" {
 			buttons = [][]telegram.Button{{
-				{Text: "↩️ ROLLBACK", CallbackData: fmt.Sprintf("rollback_%d", e.lastSuccessID)},
+				{Text: "↩️ ROLLBACK", CallbackData: fmt.Sprintf("rollback_%d", id)},
 				{Text: "✅ KEEP", CallbackData: "keep_update"},
 			}}
 		}
 	}
 	_ = api.Edit(ctx, chat, msg, formatQueueComplete(done, time.Since(queueStart)), buttons)
 	e.mu.Lock()
-	e.latestChat, e.latestMsg = chat, msg
+	e.setLatestLocked(chat, msg)
 	e.mu.Unlock()
-	_ = e.db.SetLatest(chat, msg)
 
 	if e.cfg.PruneAfterSuccess {
 		if n, err := e.docker.PruneDanglingImages(ctx); err != nil {
@@ -1029,6 +1003,18 @@ func (e *Engine) runQueue(ctx context.Context, api *telegram.API, chat, msg int6
 			slog.Info("prune after success", "reclaimed_bytes", n)
 		}
 	}
+}
+
+func (e *Engine) finishJob(job store.PendingItem, jobs []store.PendingItem, next int, status string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	pending := withoutJobs(e.pending, []int64{job.RecordID})
+	if err := e.db.SaveQueue(pending, jobs[next:], 0, false, []int64{job.RecordID}, status); err != nil {
+		e.paused = true
+		return err
+	}
+	e.pending = pending
+	return nil
 }
 
 func (e *Engine) showHeld(ctx context.Context, api *telegram.API, chat, msg int64, title, note string) {
@@ -1046,9 +1032,8 @@ func (e *Engine) showHeld(ctx context.Context, api *telegram.API, chat, msg int6
 	if len(e.pending) > 0 {
 		buttons = e.pendingButtonsLocked()
 	}
-	e.latestChat, e.latestMsg = chat, msg
+	e.setLatestLocked(chat, msg)
 	e.mu.Unlock()
-	_ = e.db.SetLatest(chat, msg)
 	_ = api.Edit(ctx, chat, msg, b.String(), buttons)
 }
 
@@ -1069,8 +1054,6 @@ func (e *Engine) runOne(ctx, opCtx context.Context, api *telegram.API, chat, msg
 		return out, err
 	}
 	if err != nil {
-		_ = e.db.SetStatus(item.RecordID, store.StatusFailed, err.Error())
-		_ = e.db.AppendLog(item.RecordID, err.Error())
 		slog.Error("compose target resolve failed", "image", image, "err", err)
 		out.Duration = time.Since(start)
 		return out, err
@@ -1086,15 +1069,39 @@ func (e *Engine) runOne(ctx, opCtx context.Context, api *telegram.API, chat, msg
 		"config_files", len(target.ConfigFiles),
 		"previous_image", prevImage,
 	)
-	_ = e.db.SetRollbackMeta(item.RecordID, target.Project, target.Service, prevImage, prevDigest, image, ev.Digest, target.Container)
-
-	_ = e.db.SetStatus(item.RecordID, store.StatusPulling, "")
+	immutable := ev.DigestRef()
+	if immutable == "" || !dockerapi.SameImageRef(prevImage, image) {
+		return out, fmt.Errorf("detected image %q no longer matches %q or has no valid digest", image, prevImage)
+	}
+	configuredImage, err := compose.Image(opCtx, target)
+	if err != nil {
+		return out, err
+	}
+	if !dockerapi.SameImageRef(configuredImage, prevImage) || strings.Contains(configuredImage, "@") {
+		return out, fmt.Errorf("Compose image %q changed or is pinned; confirm the service configuration", configuredImage)
+	}
+	// Retrying after a recreate must retain the original rollback image.
+	if record, ok := e.db.Get(item.RecordID); ok && record.PreviousDigest != "" {
+		if record.Project != target.Project || record.Service != target.Service {
+			return out, fmt.Errorf("Compose target changed since this update was attempted")
+		}
+		prevDigest = record.PreviousDigest
+	}
+	if err := e.docker.TagImage(opCtx, prevDigest, rollbackTag(prevDigest)); err != nil {
+		return out, fmt.Errorf("retain rollback image: %w", err)
+	}
+	if err := e.db.SetRollbackMeta(item.RecordID, target.Project, target.Service, configuredImage, prevDigest, image, ev.Digest, target.Container); err != nil {
+		return out, fmt.Errorf("save rollback image: %w", err)
+	}
+	if err := e.db.SetStatus(item.RecordID, store.StatusPulling, ""); err != nil {
+		return out, err
+	}
 	slog.Info("pull starting", "step", n, "of", total, "image", image, "id", item.RecordID)
 	_ = api.Edit(ctx, chat, msg, formatStepPull(n, total, image), e.processingButtons())
 
 	last := time.Time{}
 	lastPct := -1
-	err = e.docker.PullImage(opCtx, image, func(s dockerapi.PullState) {
+	err = e.docker.PullImage(opCtx, immutable, func(s dockerapi.PullState) {
 		if time.Since(last) < e.cfgRefresh() {
 			return
 		}
@@ -1114,17 +1121,23 @@ func (e *Engine) runOne(ctx, opCtx context.Context, api *telegram.API, chat, msg
 			out.Duration = time.Since(start)
 			return out, errUserCancel
 		}
-		_ = e.db.SetStatus(item.RecordID, store.StatusFailed, err.Error())
-		_ = e.db.AppendLog(item.RecordID, err.Error())
 		slog.Error("pull failed", "image", image, "err", err)
 		out.Duration = time.Since(start)
 		return out, err
 	}
-	_ = e.db.SetStatus(item.RecordID, store.StatusPulled, "")
+	expectedID, err := e.docker.ImageID(opCtx, immutable)
+	if err != nil {
+		return out, err
+	}
 	slog.Info("pull complete", "image", image, "duration", time.Since(start).Round(time.Second).String())
 	_ = api.Edit(ctx, chat, msg, formatStepPullDone(n, total, image, time.Since(start)), e.processingButtons())
 
-	_ = e.db.SetStatus(item.RecordID, store.StatusUpdating, "")
+	if err := e.db.SetStatus(item.RecordID, store.StatusUpdating, ""); err != nil {
+		return out, err
+	}
+	if err := e.docker.TagImage(opCtx, expectedID, configuredImage); err != nil {
+		return out, err
+	}
 	_ = api.Edit(ctx, chat, msg, formatStepRecreate(n, total, target.Service, target.ProjectDir), e.processingButtons())
 	slog.Info("compose up starting", "service", target.Service, "dir", target.ProjectDir)
 	composeOut, err := compose.Up(opCtx, target)
@@ -1137,34 +1150,25 @@ func (e *Engine) runOne(ctx, opCtx context.Context, api *telegram.API, chat, msg
 			out.Duration = time.Since(start)
 			return out, errUserCancel
 		}
-		_ = e.db.SetStatus(item.RecordID, store.StatusFailed, err.Error()+": "+composeOut)
 		slog.Error("compose up failed", "service", target.Service, "err", err, "output", strings.TrimSpace(composeOut))
 		out.Duration = time.Since(start)
 		return out, fmt.Errorf("compose update failed: %w", err)
 	}
 	slog.Info("compose up complete", "service", target.Service)
-	if name, ferr := e.docker.FindComposeContainer(opCtx, target.Project, target.Service); ferr == nil && name != "" {
-		target.Container = name
-		out.Container = name
-	}
-
 	_ = e.db.SetStatus(item.RecordID, store.StatusVerifying, "")
 	_ = api.Edit(ctx, chat, msg, formatStepHealth(n, total, target.Service), e.processingButtons())
 	slog.Info("health verification starting", "container", target.Container, "timeout_sec", e.cfg.Update.HealthTimeoutSeconds)
-	if err := e.verifyHealth(opCtx, target.Container); err != nil {
+	if err := e.verifyHealth(opCtx, target, expectedID); err != nil {
 		if e.userCancelled() {
 			out.Duration = time.Since(start)
 			return out, errUserCancel
 		}
-		_ = e.db.SetStatus(item.RecordID, store.StatusFailed, err.Error())
-		_ = e.db.AppendLog(item.RecordID, err.Error())
 		slog.Error("health verification failed", "container", target.Container, "err", err)
 		out.Duration = time.Since(start)
 		return out, err
 	}
 	slog.Info("health verification ok", "container", target.Container)
 
-	_ = e.db.SetStatus(item.RecordID, store.StatusSuccess, "")
 	out.Duration = time.Since(start)
 	slog.Info("update success",
 		"step", n, "of", total,
@@ -1172,19 +1176,17 @@ func (e *Engine) runOne(ctx, opCtx context.Context, api *telegram.API, chat, msg
 		"image", image,
 		"duration", out.Duration.Round(time.Second).String(),
 	)
-	_ = api.Edit(ctx, chat, msg, formatStepSuccess(n, total, out), e.processingButtons())
 	return out, nil
 }
 
 func (e *Engine) resolveComposeTarget(ctx context.Context, ev diun.Event) (compose.Target, string, string, error) {
-	name := ""
-	if ev.Metadata != nil {
-		name = ev.Metadata["ctn_names"]
-	}
-	name = strings.TrimPrefix(strings.Split(name, ",")[0], "/")
+	name := containerName(ev)
 	if name == "" {
-		found, ferr := e.docker.FindRunningByImage(ctx, ev.Image)
-		if ferr != nil || found == "" {
+		found, err := e.docker.FindRunningByImage(ctx, ev.Image)
+		if err != nil {
+			return compose.Target{}, "", "", err
+		}
+		if found == "" {
 			return compose.Target{}, "", "", fmt.Errorf("%w: no container name for %s", errSkipJob, ev.Image)
 		}
 		slog.Info("resolved container by image", "image", ev.Image, "container", found)
@@ -1202,7 +1204,7 @@ func (e *Engine) resolveComposeTarget(ctx context.Context, ev diun.Event) (compo
 	dir := labels["com.docker.compose.project.working_dir"]
 	project := labels["com.docker.compose.project"]
 	files := compose.ParseConfigFiles(labels["com.docker.compose.project.config_files"])
-	if service == "" || dir == "" {
+	if service == "" || dir == "" || project == "" {
 		return compose.Target{}, "", "", fmt.Errorf("%s is not a Compose-managed container", name)
 	}
 	dir = filepath.Clean(dir)
@@ -1223,50 +1225,45 @@ func (e *Engine) resolveComposeTarget(ctx context.Context, ev diun.Event) (compo
 	}, prevImage, prevDigest, nil
 }
 
-func (e *Engine) verifyHealth(ctx context.Context, containerName string) error {
+func (e *Engine) verifyHealth(ctx context.Context, target compose.Target, expectedID string) error {
 	timeout := time.Duration(e.cfg.Update.HealthTimeoutSeconds) * time.Second
 	if timeout < time.Second {
 		timeout = 120 * time.Second
 	}
-	deadline := time.Now().Add(timeout)
-	last := ""
-	for time.Now().Before(deadline) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	last := "not inspected"
+	for {
+		info, err := e.docker.InspectContainer(ctx, target.Container)
+		switch {
+		case err != nil:
+			last = err.Error()
+		case info.Config.Labels["com.docker.compose.project"] != target.Project || info.Config.Labels["com.docker.compose.service"] != target.Service:
+			return fmt.Errorf("container %q no longer belongs to %s/%s", target.Container, target.Project, target.Service)
+		case info.Image != expectedID:
+			return fmt.Errorf("container %q is using image %s, expected %s", target.Container, info.Image, expectedID)
+		default:
+			last = info.State.Status
+			if info.State.Running && !e.cfg.RequireHealthy {
+				return nil
+			}
+			if info.State.Health != nil {
+				last = info.State.Health.Status
+				if info.State.Running && last == "healthy" {
+					return nil
+				}
+			} else if e.cfg.RequireHealthy {
+				return fmt.Errorf("container %q has no Docker HEALTHCHECK", target.Container)
+			}
+		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		default:
+			return fmt.Errorf("health verification for %q: %w (last status %s)", target.Container, ctx.Err(), last)
+		case <-ticker.C:
 		}
-		info, err := e.docker.InspectContainer(ctx, containerName)
-		if err != nil {
-			last = err.Error()
-			slog.Debug("health poll retry", "container", containerName, "err", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		hasHC := info.State.Health != nil && info.State.Health.Status != ""
-		status := info.State.Status
-		if hasHC {
-			status = info.State.Health.Status
-		} else if info.State.Running {
-			status = "running"
-		}
-		last = status
-		slog.Debug("health poll", "container", containerName, "status", status, "has_healthcheck", hasHC)
-		switch {
-		case status == "healthy":
-			return nil
-		case status == "running" && !hasHC:
-			return nil
-		case status == "running" && hasHC && !e.cfg.RequireHealthy:
-			return nil
-		}
-		// starting, unhealthy, or waiting for healthy: keep polling until timeout
-		time.Sleep(2 * time.Second)
 	}
-	if last == "" {
-		last = "unknown"
-	}
-	return fmt.Errorf("health verification timed out after %s (last status %s)", timeout, last)
 }
 
 func (e *Engine) cfgRefresh() time.Duration {

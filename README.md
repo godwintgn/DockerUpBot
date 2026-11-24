@@ -25,7 +25,7 @@ Operator checks (`dubot`, Diun scan): [docs/debug.md](docs/debug.md).
 - **Health wait** — polls until the container is healthy, or until the timeout
 - **Failure controls** — **RETRY**, **SKIP & CONTINUE**, **LOGS**, or **STOP**
 - **Stopped jobs stay pending** — `/updates` lists them so you can run or skip later
-- **Rollback** — tag the previous digest and bring the service back
+- **Rollback** — restore the retained local image and verify its image ID
 - **Quiet hours and skip lists** — hold notifications overnight, ignore noisy images
 - **Optional empty-scan ping** — a message when Diun’s cron finds zero updates
 - **Startup recovery** — if the bot restarts mid-update, it tells you and waits
@@ -65,6 +65,7 @@ Fill in `.env`:
 Open the bot in Telegram and press **Start** once, so it is allowed to message you. Then:
 
 ```bash
+docker build -t dockerupbot:local .
 docker compose up -d
 ```
 
@@ -76,7 +77,7 @@ Force a scan:
 docker compose restart diun
 ```
 
-Compose pulls `ghcr.io/godwintgn/dockerupbot:latest` and `crazymax/diun:latest`.
+The development stack uses the locally built bot image. Set `DOCKERUPBOT_IMAGE` in `.env` to use a published release tag or a pinned commit image. Main-branch builds publish `edge` and a commit tag.
 
 ### `data/bot/config.yml`
 
@@ -124,7 +125,9 @@ skip_containers: ""
 
 ### Socket access
 
-The bot mounts `/var/run/docker.sock` read-write so it can pull and recreate services. Diun mounts the same socket read-only. Treat the bot token, webhook secret, and allow-list like root credentials, and do not publish port `9467`.
+The bot mounts `/var/run/docker.sock` to pull and recreate services. Diun reads container metadata through an API proxy on its own internal network. Treat the bot token, webhook secret, and allow-list like root credentials, and keep port `9467` private.
+
+The bot keeps a local `dockerupbot-rollback` tag for each saved prior image ID. Those tags survive dangling-image pruning and continue to use disk space until an operator removes them.
 
 ## License
 

@@ -8,7 +8,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
+
+	"github.com/dockerupbot/dockerupbot/internal/diun"
 )
 
 func baseURL() string {
@@ -39,7 +40,7 @@ func runCLI(args []string) {
 		cliGET("/debug/telegram?ping=1")
 	case "diun":
 		image := ""
-		digest := fmt.Sprintf("sha256:manual-%d", time.Now().Unix())
+		digest := ""
 		container := ""
 		for i := 1; i < len(args); i++ {
 			a := args[i]
@@ -61,11 +62,11 @@ func runCLI(args []string) {
 				container = args[i]
 			}
 		}
-		if image == "" || container == "" {
-			fmt.Fprintln(os.Stderr, `error: dubot diun requires --image and --container (real names from your host)
+		if container == "" || (diun.Event{Image: image, Digest: digest}).DigestRef() == "" {
+			fmt.Fprintln(os.Stderr, `error: dubot diun requires --image, --container, and --digest (a registry sha256 digest)
 
 Example:
-  dubot diun --image ghcr.io/example/app:latest --container myproject-app-1
+  dubot diun --image ghcr.io/example/app:latest --container myproject-app-1 --digest "$DIGEST"
 
 Find a name with: docker ps --format '{{.Names}}\t{{.Image}}'
 
@@ -87,14 +88,14 @@ Usage:
   dubot health                 Process health JSON
   dubot telegram               Check Telegram API (getMe, no chat message)
   dubot ping                   Send a test Telegram message to notify targets
-  dubot diun --image IMG --container NAME
-                               Fire a manual Diun-style webhook (both flags required)
+  dubot diun --image IMG --container NAME --digest DIGEST
+                               Fire a manual Diun-style webhook
   dubot help                   Show this help
 
 From the host:
   docker compose exec dockerupbot dubot ping
   docker compose exec dockerupbot dubot telegram
-  docker compose exec dockerupbot dubot diun --image IMAGE --container CONTAINER_NAME
+  docker compose exec dockerupbot dubot diun --image IMAGE --container CONTAINER_NAME --digest "$DIGEST"
 
 CONTAINER_NAME must exist (docker ps). Clicking UPDATE will pull + recreate that compose service.
 `)

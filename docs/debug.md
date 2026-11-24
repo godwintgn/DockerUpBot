@@ -13,7 +13,7 @@ docker compose exec dockerupbot dubot <command>
 | `dubot health` | Process health JSON (version + bot username) |
 | `dubot telegram` | Live Telegram `getMe` check (no chat message) |
 | `dubot ping` | Send a test Telegram message to notify targets |
-| `dubot diun --image … --container …` | Manually fire a Diun-style webhook (bot only) |
+| `dubot diun --image … --container … --digest …` | Manually fire a Diun-style webhook (bot only) |
 | `dubot help` | Show help |
 
 ## Everyday testing
@@ -49,12 +49,13 @@ docker compose exec diun diun notif test
 # Expect bot log: webhook ignored: test payload or missing ctn_names
 ```
 
-To exercise a real UPDATE flow, use a real container:
+To exercise a real UPDATE flow, set `DIGEST` to the registry manifest digest for the image you want to deploy, then use a real container.
 
 ```bash
 docker compose exec dockerupbot dubot diun \
   --image YOUR_IMAGE:tag \
-  --container YOUR_CONTAINER_NAME
+  --container YOUR_CONTAINER_NAME \
+  --digest "$DIGEST"
 ```
 
 Inspect what Diun already knows:
@@ -74,12 +75,13 @@ docker ps --format '{{.Names}}\t{{.Image}}'
 
 docker compose exec dockerupbot dubot diun \
   --image YOUR_IMAGE:tag \
-  --container YOUR_CONTAINER_NAME
+  --container YOUR_CONTAINER_NAME \
+  --digest "$DIGEST"
 ```
 
 **Important:** `ALLOWED_USERS` must be *your* numeric Telegram user ID, not the bot id from `dubot telegram`.
 
-After a successful webhook you should see logs: `webhook received` → `telegram notify sent`, and an UPDATE/SKIP message in Telegram.
+A successful webhook logs `webhook received` and sends an UPDATE/SKIP card to Telegram.
 
 ## Startup check
 
@@ -140,4 +142,12 @@ If one image fails, use **SKIP & CONTINUE** to drop that image and run the rest.
 ```bash
 docker compose pull
 docker compose up -d --force-recreate
+```
+
+## Local integration test
+
+Run the update and rollback test with Docker and Compose available. It pulls two Alpine images and creates and removes its own Compose project.
+
+```bash
+DOCKERUPBOT_TEST_DOCKER=1 go test -run TestComposeUpdateAndRollback ./internal/dockerupdater
 ```

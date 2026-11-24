@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/dockerupbot/dockerupbot/internal/compose"
 	"github.com/dockerupbot/dockerupbot/internal/diun"
+	"github.com/dockerupbot/dockerupbot/internal/dockerapi"
 	"github.com/dockerupbot/dockerupbot/internal/store"
 	"github.com/dockerupbot/dockerupbot/internal/telegram"
 )
@@ -36,26 +38,16 @@ func (e *Engine) NotifyRecovery(ctx context.Context) {
 		return
 	}
 	text := formatRecovery(n)
-	buttons := [][]telegram.Button{{
-		{Text: "▶️ CONTINUE", CallbackData: "queue_continue"},
-		{Text: "⏹️ STOP", CallbackData: "queue_stop"},
-		{Text: "📋 LOGS", CallbackData: "show_logs"},
-	}}
-	var lastChat, lastMsg int64
+	buttons := pausedButtons()
 	for _, chat := range targets {
 		id, err := e.bot.Send(ctx, chat, text, buttons)
 		if err != nil {
 			slog.Error("recovery notify failed", "chat", chat, "err", err)
 			continue
 		}
-		lastChat, lastMsg = chat, id
-	}
-	if lastChat != 0 {
 		e.mu.Lock()
-		e.latestChat, e.latestMsg = lastChat, lastMsg
+		e.setLatestLocked(chat, id)
 		e.mu.Unlock()
-		_ = e.db.SetLatest(lastChat, lastMsg)
-		slog.Info("recovery notification sent", "jobs", n, "chat", lastChat, "message", lastMsg)
 	}
 }
 
@@ -101,52 +93,74 @@ func (e *Engine) rollbackByID(ctx context.Context, api *telegram.API, chat, msg,
 			"No previous image metadata for this job.\n\n"+msgFooter(""), nil)
 		return
 	}
-	_ = e.db.SetStatus(recordID, store.StatusRollingBack, "")
-	_ = api.Edit(ctx, chat, msg, msgHeader("↩️ <b>Rolling back</b>")+
-		fmt.Sprintf("<code>%s</code>\n↳ <code>%s</code>\n\n", htmlEscape(rec.Image), htmlEscape(rec.PreviousImage))+
-		msgFooter("Live"), [][]telegram.Button{})
-
-	tagAs := rec.PreviousImage
-	if tagAs == "" {
-		tagAs = rec.NewImage
-	}
-	if err := e.docker.TagImage(ctx, rec.PreviousDigest, tagAs); err != nil {
-		slog.Error("rollback tag failed", "err", err)
-		_ = e.db.SetStatus(recordID, store.StatusFailed, "rollback tag: "+err.Error())
-		_ = api.Edit(ctx, chat, msg, msgHeader("❌ <b>Rollback failed</b>")+htmlEscape(err.Error())+"\n\n"+msgFooter(""), [][]telegram.Button{})
+	e.mu.Lock()
+	if e.running {
+		e.mu.Unlock()
+		_, _ = api.Send(ctx, chat, "An update is already running.", nil)
 		return
 	}
+	e.running = true
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.running = false
+		e.mu.Unlock()
+		e.armCoalesce()
+	}()
 
+	_ = api.Edit(ctx, chat, msg, msgHeader("↩️ <b>Rolling back</b>")+
+		fmt.Sprintf("<code>%s</code>\n", htmlEscape(rec.Image)), [][]telegram.Button{})
+	if err := e.restoreImage(ctx, rec); err != nil {
+		slog.Error("rollback failed", "id", recordID, "err", err)
+		_ = e.db.SetStatus(recordID, store.StatusFailed, "rollback: "+err.Error())
+		_ = api.Edit(ctx, chat, msg, msgHeader("❌ <b>Rollback failed</b>")+htmlEscape(err.Error()), [][]telegram.Button{})
+		return
+	}
+	if err := e.db.SetStatus(recordID, store.StatusRolledBack, ""); err != nil {
+		slog.Error("save rollback result", "id", recordID, "err", err)
+		_ = api.Edit(ctx, chat, msg, "Previous image restored. Could not save the rollback result.", [][]telegram.Button{})
+		return
+	}
+	_ = api.Edit(ctx, chat, msg, formatRolledBack(rec.Image, rec.PreviousImage), [][]telegram.Button{})
+}
+
+func rollbackTag(imageID string) string {
+	return "dockerupbot-rollback:" + strings.TrimPrefix(imageID, "sha256:")
+}
+
+func (e *Engine) restoreImage(ctx context.Context, rec store.Record) error {
 	ev := diun.Event{
-		Image:  firstNonEmpty(rec.NewImage, rec.Image),
-		Digest: rec.NewDigest,
-		Metadata: map[string]string{
-			"ctn_names": rec.ContainerName,
-		},
+		Image:    firstNonEmpty(rec.NewImage, rec.Image),
+		Metadata: map[string]string{"ctn_names": rec.ContainerName},
 	}
 	target, _, _, err := e.resolveComposeTarget(ctx, ev)
 	if err != nil {
-		_ = e.db.SetStatus(recordID, store.StatusFailed, "rollback resolve: "+err.Error())
-		_ = api.Edit(ctx, chat, msg, msgHeader("❌ <b>Rollback failed</b>")+htmlEscape(err.Error())+"\n\n"+msgFooter(""), [][]telegram.Button{})
-		return
+		return err
+	}
+	if target.Project != rec.Project || target.Service != rec.Service {
+		return fmt.Errorf("rollback target is now %s/%s", target.Project, target.Service)
+	}
+	configuredImage, err := compose.Image(ctx, target)
+	if err != nil {
+		return err
+	}
+	if !dockerapi.SameImageRef(configuredImage, rec.PreviousImage) || strings.Contains(configuredImage, "@") {
+		return fmt.Errorf("Compose image changed to %q since the update", configuredImage)
+	}
+	if err := e.db.SetStatus(rec.ID, store.StatusRollingBack, ""); err != nil {
+		return err
+	}
+	if err := e.docker.TagImage(ctx, rec.PreviousDigest, configuredImage); err != nil {
+		return err
 	}
 	out, err := compose.Up(ctx, target)
 	if out != "" {
-		_ = e.db.AppendLog(recordID, out)
+		_ = e.db.AppendLog(rec.ID, out)
 	}
 	if err != nil {
-		_ = e.db.SetStatus(recordID, store.StatusFailed, "rollback compose: "+err.Error())
-		_ = api.Edit(ctx, chat, msg, msgHeader("❌ <b>Rollback failed</b>")+htmlEscape(err.Error())+"\n\n"+msgFooter(""), [][]telegram.Button{})
-		return
+		return fmt.Errorf("rollback compose: %w", err)
 	}
-	if err := e.verifyHealth(ctx, target.Container); err != nil {
-		_ = e.db.SetStatus(recordID, store.StatusFailed, "rollback health: "+err.Error())
-		_ = api.Edit(ctx, chat, msg, msgHeader("❌ <b>Rollback health failed</b>")+htmlEscape(err.Error())+"\n\n"+msgFooter(""), [][]telegram.Button{})
-		return
-	}
-	_ = e.db.SetStatus(recordID, store.StatusRolledBack, "")
-	_ = api.Edit(ctx, chat, msg, formatRolledBack(rec.Image, rec.PreviousImage), [][]telegram.Button{})
-	slog.Info("rollback complete", "id", recordID, "image", rec.Image, "previous", rec.PreviousImage)
+	return e.verifyHealth(ctx, target, rec.PreviousDigest)
 }
 
 func firstNonEmpty(a, b string) string {

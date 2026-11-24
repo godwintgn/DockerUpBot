@@ -2,13 +2,14 @@ package diun
 
 import (
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
 )
 
-type Engine interface{ DiunEvent(Event) }
+type Engine interface{ DiunEvent(Event) error }
 type Event struct {
 	DiunVersion string            `json:"diun_version"`
 	Hostname    string            `json:"hostname"`
@@ -26,6 +27,11 @@ type Handler struct {
 func NewHandler(e Engine, secret string) *Handler { return &Handler{engine: e, secret: secret} }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	remote := r.RemoteAddr
 	if h.secret == "" {
 		slog.Error("webhook rejected: WEBHOOK_SECRET not configured")
@@ -76,8 +82,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"diun", e.DiunVersion,
 		"remote", remote,
 	)
-	h.engine.DiunEvent(e)
+	if e.DigestRef() == "" {
+		http.Error(w, "image and sha256 digest required", http.StatusBadRequest)
+		return
+	}
+	if err := h.engine.DiunEvent(e); err != nil {
+		slog.Error("failed to save Diun event", "image", e.Image, "err", err)
+		http.Error(w, "could not save update", http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// DigestRef returns the immutable reference for the detected image.
+func (e Event) DigestRef() string {
+	if !strings.HasPrefix(e.Digest, "sha256:") || len(e.Digest) != 71 || strings.ToLower(e.Digest) != e.Digest {
+		return ""
+	}
+	if _, err := hex.DecodeString(e.Digest[7:]); err != nil {
+		return ""
+	}
+	repo, _, _ := strings.Cut(e.Image, "@")
+	if i := strings.LastIndex(repo, ":"); i > strings.LastIndex(repo, "/") {
+		repo = repo[:i]
+	}
+	if repo == "" || strings.ContainsAny(repo, " \t\r\n") {
+		return ""
+	}
+	return repo + "@" + e.Digest
 }
 
 // IsTestOrIncomplete is true for Diun notif-test payloads and events without a container name.

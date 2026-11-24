@@ -297,37 +297,25 @@ func (c *Client) ListContainers(ctx context.Context, filters string) ([]ListedCo
 	return out, nil
 }
 
-// FindRunningByImage returns one container whose image ref matches image.
+// FindRunningByImage resolves an image only when there is one matching container.
 func (c *Client) FindRunningByImage(ctx context.Context, image string) (string, error) {
 	list, err := c.ListContainers(ctx, `{"status":["running"]}`)
 	if err != nil {
 		return "", err
 	}
+	var name string
 	for _, ct := range list {
-		if sameImageRef(ct.Image, image) && ct.Name != "" {
-			return ct.Name, nil
+		if SameImageRef(ct.Image, image) && ct.Name != "" {
+			if name != "" {
+				return "", fmt.Errorf("multiple containers use %s; a container name is required", image)
+			}
+			name = ct.Name
 		}
 	}
-	return "", nil
+	return name, nil
 }
 
-// FindComposeContainer returns the container for a Compose project/service.
-func (c *Client) FindComposeContainer(ctx context.Context, project, service string) (string, error) {
-	if project == "" || service == "" {
-		return "", nil
-	}
-	filters := fmt.Sprintf(`{"label":["com.docker.compose.project=%s","com.docker.compose.service=%s"]}`, project, service)
-	list, err := c.ListContainers(ctx, filters)
-	if err != nil {
-		return "", err
-	}
-	if len(list) == 0 {
-		return "", nil
-	}
-	return list[0].Name, nil
-}
-
-func sameImageRef(a, b string) bool {
+func SameImageRef(a, b string) bool {
 	return normImage(a) == normImage(b) && normImage(a) != ""
 }
 
@@ -335,10 +323,33 @@ func normImage(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "docker.io/")
 	s = strings.TrimPrefix(s, "library/")
-	if i := strings.Index(s, "@"); i >= 0 {
-		s = s[:i]
+	if s != "" && !strings.Contains(s, "@") && !strings.Contains(s[strings.LastIndex(s, "/")+1:], ":") {
+		s += ":latest"
 	}
 	return s
+}
+
+func (c *Client) ImageID(ctx context.Context, ref string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.api("/images/"+url.PathEscape(ref)+"/json"), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("inspect image %s returned HTTP %d", ref, resp.StatusCode)
+	}
+	var image struct{ ID string }
+	if err := json.NewDecoder(resp.Body).Decode(&image); err != nil {
+		return "", err
+	}
+	if image.ID == "" {
+		return "", fmt.Errorf("Docker returned no ID for image %s", ref)
+	}
+	return image.ID, nil
 }
 
 func (c *Client) ContainerHealth(ctx context.Context, name string) (string, error) {
@@ -591,7 +602,7 @@ func registryHost(ref string) string {
 	ref = strings.TrimPrefix(ref, "https://")
 	ref = strings.TrimPrefix(ref, "http://")
 	parts := strings.Split(ref, "/")
-	if len(parts) == 0 {
+	if len(parts) < 2 {
 		return "docker.io"
 	}
 	first := parts[0]

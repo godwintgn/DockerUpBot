@@ -1,6 +1,6 @@
 services:
   dockerupbot:
-    image: ghcr.io/godwintgn/dockerupbot:latest
+    image: ${DOCKERUPBOT_IMAGE:-dockerupbot:local}
     container_name: dockerupbot
     restart: unless-stopped
     env_file: .env
@@ -19,19 +19,19 @@ services:
       start_period: 15s
 
   diun:
-    image: crazymax/diun:latest
+    image: crazymax/diun@sha256:f350e8e7cc0e3b33d500e2fc462ac9273d8954327f32e2501b34b6bef5a0de3e
     container_name: diun
     command: serve
     restart: unless-stopped
     volumes:
       - ./data/diun:/data
-      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - TZ=${TZ:-Asia/Muscat}
       - DIUN_WATCH_WORKERS=20
       - DIUN_WATCH_SCHEDULE=0 */6 * * *
       - DIUN_WATCH_FIRSTCHECKNOTIF=false
       - DIUN_PROVIDERS_DOCKER=true
+      - DIUN_PROVIDERS_DOCKER_ENDPOINT=tcp://diun-docker:2375
       - DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=true
       - DIUN_NOTIF_WEBHOOK_ENDPOINT=http://dockerupbot:9467/webhook/diun
       - DIUN_NOTIF_WEBHOOK_METHOD=POST
@@ -40,8 +40,22 @@ services:
       - DIUN_NOTIF_WEBHOOK_TIMEOUT=10s
     networks:
       - du-tunnel
+      - diun-docker
     mem_limit: 256m
+
+  diun-docker:
+    image: ghcr.io/tecnativa/docker-socket-proxy@sha256:be1ac64f33bd82043beb504822a17ba6b71668ea1ad7cf51a9a01d27bb7ab047
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"
+      POST: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - diun-docker
 
 networks:
   du-tunnel:
     name: du-tunnel
+  diun-docker:
+    internal: true

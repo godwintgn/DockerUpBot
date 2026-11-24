@@ -2,6 +2,7 @@ package diun_test
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -13,18 +14,20 @@ import (
 type captureEngine struct {
 	mu     sync.Mutex
 	events []diun.Event
+	err    error
 }
 
-func (c *captureEngine) DiunEvent(e diun.Event) {
+func (c *captureEngine) DiunEvent(e diun.Event) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events = append(c.events, e)
+	return c.err
 }
 
 func TestWebhookAcceptsUpdate(t *testing.T) {
 	eng := &captureEngine{}
 	h := diun.NewHandler(eng, "secret")
-	body := `{"status":"update","image":"nginx:latest","digest":"sha256:abc","metadata":{"ctn_names":"web"}}`
+	body := `{"status":"update","image":"nginx:latest","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","metadata":{"ctn_names":"web"}}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/diun", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "secret")
@@ -41,7 +44,7 @@ func TestWebhookAcceptsUpdate(t *testing.T) {
 func TestWebhookRejectsBadSecret(t *testing.T) {
 	eng := &captureEngine{}
 	h := diun.NewHandler(eng, "secret")
-	body := `{"status":"update","image":"nginx:latest","digest":"sha256:abc","metadata":{"ctn_names":"web"}}`
+	body := `{"status":"update","image":"nginx:latest","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","metadata":{"ctn_names":"web"}}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/diun", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "wrong")
@@ -55,7 +58,7 @@ func TestWebhookRejectsBadSecret(t *testing.T) {
 func TestWebhookIgnoresNonUpdateStatus(t *testing.T) {
 	eng := &captureEngine{}
 	h := diun.NewHandler(eng, "secret")
-	body := `{"status":"error","image":"nginx:latest","digest":"sha256:abc"}`
+	body := `{"status":"error","image":"nginx:latest","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/diun", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "secret")
@@ -72,7 +75,7 @@ func TestWebhookIgnoresNonUpdateStatus(t *testing.T) {
 func TestWebhookIgnoresTestNotif(t *testing.T) {
 	eng := &captureEngine{}
 	h := diun.NewHandler(eng, "secret")
-	body := `{"status":"new","image":"docker.io/diun/testnotif:latest","digest":"sha256:abc"}`
+	body := `{"status":"new","image":"docker.io/diun/testnotif:latest","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/diun", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "secret")
@@ -89,7 +92,7 @@ func TestWebhookIgnoresTestNotif(t *testing.T) {
 func TestWebhookIgnoresMissingContainer(t *testing.T) {
 	eng := &captureEngine{}
 	h := diun.NewHandler(eng, "secret")
-	body := `{"status":"update","image":"nginx:latest","digest":"sha256:abc"}`
+	body := `{"status":"update","image":"nginx:latest","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/diun", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "secret")
@@ -106,5 +109,18 @@ func TestIsTestOrIncomplete(t *testing.T) {
 	}
 	if diun.IsTestOrIncomplete(diun.Event{Image: "nginx:latest", Metadata: map[string]string{"ctn_names": "web"}}) {
 		t.Fatal("valid")
+	}
+}
+
+func TestWebhookReportsUnsavedEvent(t *testing.T) {
+	eng := &captureEngine{err: errors.New("write failed")}
+	body := `{"status":"update","image":"nginx:latest","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","metadata":{"ctn_names":"web"}}`
+	req := httptest.NewRequest(http.MethodPost, "/webhook/diun", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "secret")
+	rec := httptest.NewRecorder()
+	diun.NewHandler(eng, "secret").ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", rec.Code)
 	}
 }

@@ -110,7 +110,13 @@ func (a *API) call(ctx context.Context, method string, values url.Values) (map[s
 		resp, err := a.client.Do(req)
 		if err != nil {
 			lastErr = a.redactErr(err)
-			time.Sleep(time.Duration(attempt+1) * time.Second)
+			if attempt < 3 {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(time.Duration(attempt+1) * time.Second):
+				}
+			}
 			continue
 		}
 		body, _ := io.ReadAll(resp.Body)

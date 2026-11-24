@@ -3,6 +3,7 @@ package compose
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -72,16 +73,39 @@ func resolvePath(p string) (string, error) {
 	return abs, nil
 }
 
-// Up recreates a single service: docker compose [-f ...] up -d -- <service>
-func Up(ctx context.Context, t Target) (string, error) {
-	args := []string{"compose"}
+func command(ctx context.Context, t Target, args ...string) *exec.Cmd {
+	base := []string{"compose", "--project-name", t.Project, "--project-directory", t.ProjectDir}
 	for _, f := range t.ConfigFiles {
-		args = append(args, "-f", f)
+		base = append(base, "-f", f)
 	}
-	args = append(args, "up", "-d", "--", t.Service)
-	slog.Info("exec docker compose", "dir", t.ProjectDir, "args", strings.Join(args, " "))
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := exec.CommandContext(ctx, "docker", append(base, args...)...)
 	cmd.Dir = t.ProjectDir
+	return cmd
+}
+
+// Image returns the resolved image reference for the target service.
+func Image(ctx context.Context, t Target) (string, error) {
+	out, err := command(ctx, t, "config", "--no-env-resolution", "--format", "json", "--", t.Service).Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve Compose image: %w", err)
+	}
+	var config struct {
+		Services map[string]struct{ Image string }
+	}
+	if err := json.Unmarshal(out, &config); err != nil {
+		return "", fmt.Errorf("decode Compose config: %w", err)
+	}
+	image := config.Services[t.Service].Image
+	if image == "" {
+		return "", fmt.Errorf("no configured image for service %q", t.Service)
+	}
+	return image, nil
+}
+
+// Up recreates one service using its locally prepared image.
+func Up(ctx context.Context, t Target) (string, error) {
+	cmd := command(ctx, t, "up", "-d", "--no-deps", "--pull", "never", "--no-build", "--", t.Service)
+	slog.Info("exec docker compose", "dir", t.ProjectDir, "args", cmd.Args)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf

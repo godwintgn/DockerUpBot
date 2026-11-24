@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -53,8 +54,8 @@ func TestAddSetStatusAndPendingRoundTrip(t *testing.T) {
 	if len(pending) != 1 || pending[0].Event.Image != "nginx:latest" {
 		t.Fatalf("pending=%v", pending)
 	}
-	latest := db2.GetLatest()
-	if latest == nil || latest.ChatID != 42 || latest.MessageID != 99 {
+	latest := db2.LatestMessages()
+	if latest[42] != 99 {
 		t.Fatalf("latest=%v", latest)
 	}
 }
@@ -96,5 +97,28 @@ func TestRollbackMeta(t *testing.T) {
 	r, ok := db.Get(id)
 	if !ok || r.PreviousDigest != "sha256:old" || r.Service != "svc" {
 		t.Fatalf("%+v", r)
+	}
+}
+
+func TestSaveEventFailureLeavesPendingStateIntact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := diun.Event{Image: "app:latest", Digest: "sha256:first"}
+	items, err := db.SaveEvent(first, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path+".tmp", 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveEvent(diun.Event{Image: first.Image, Digest: "sha256:later"}, items[0].RecordID); err == nil {
+		t.Fatal("SaveEvent accepted a failed write")
+	}
+	pending := db.GetPending()
+	if len(pending) != 1 || pending[0].Event.Digest != first.Digest || len(db.ListHistory(0)) != 1 {
+		t.Fatalf("pending=%+v history=%+v", pending, db.ListHistory(0))
 	}
 }

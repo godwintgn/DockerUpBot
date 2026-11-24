@@ -93,7 +93,10 @@ func formatConfirmation(jobs []store.PendingItem) string {
 	b.WriteString(msgHeader(fmt.Sprintf("✅ <b>Confirm %d update(s)</b>", len(jobs))))
 	b.WriteString("Will run <b>one at a time</b>:\n\n")
 	for i, j := range jobs {
-		fmt.Fprintf(&b, "%d. <code>%s</code>\n", i+1, htmlEscape(j.Event.Image))
+		fmt.Fprintf(&b, "%d. <code>%s</code> · <code>%s</code>\n", i+1, htmlEscape(j.Event.Image), htmlEscape(shortDigest(j.Event.Digest)))
+		if name := containerName(j.Event); name != "" {
+			fmt.Fprintf(&b, "   <code>%s</code>\n", htmlEscape(name))
+		}
 	}
 	b.WriteByte('\n')
 	b.WriteString(msgFooter("Review then START or CANCEL"))
